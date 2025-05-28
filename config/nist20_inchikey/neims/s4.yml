@@ -1,0 +1,73 @@
+wandb_name: nist20_inchikey_neims_s4
+wandb_group: nist20_inchikey_neims
+
+# seed
+seed: 132548
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_inchikey
+spec_params:
+  merge: True
+  nce: True
+  merge_keep_ces: True
+  preprocess: True
+mol_params:
+  fingerprint_morgan: True
+  fingerprint_rdkit: True
+  fingerprint_maccs: True
+  fingerprint: True
+  pyg: False
+  preprocess: True
+frag_params:
+  pyg: False
+
+# model stuff
+model_type: neims
+mlp_hidden_size: 1024
+mlp_dropout: 0.1
+mlp_num_layers: 4
+mlp_use_residuals: True
+ff_prec_mz_offset: 50
+ff_bidirectional: True
+ff_output_map_size: 256
+ce_insert_type: embed
+ce_insert_location: mlp
+ce_insert_merge: True
+mz_max: 1500.0
+mz_bin_res: 0.01
+sum_ints: True
+
+# loss stuff
+loss_type: cosine_distance
+sparse_cosine_similarity: True
+ints_transform: sqrt
+
+# optimization stuff
+train_batch_size: 256
+eval_batch_size: 256
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.0004006
+weight_decay: 0.0000001
+accelerator: gpu
+devices: 1
+min_epochs: 200
+max_epochs: 200
+lr_schedule: True
+lr_decay_rate: 0.7224
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+checkpoint_metric_mode: max
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: True

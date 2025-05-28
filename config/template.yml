@@ -1,0 +1,340 @@
+# wandb
+wandb_entity: fragnnet # TODO: change to your wandb entity
+wandb_project: fragnnet # TODO: change to your wandb project
+wandb_name: template
+wandb_group:
+wandb_tags:
+wandb_root_dir: checkpoint
+# data
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_inchikey
+frag_dp: data/frag/nist20_d3/dags
+magma_dp: data/magma
+ann_fp: data/proc/nist20/ann_df.pkl
+subsample_params:
+  subsample_size: 0
+  subsample_seed: 420
+  train: True
+  val: True
+  test: True
+  secondary: True
+spec_params:
+  merge: True
+  merge_keep_ces: False
+  sparse: True
+  prec_type: True
+  prec_type_str: False
+  prec_types:
+    - "[M+H]+"
+  inst_type: True
+  inst_types:
+    - "FT"
+  prec_mz: True
+  prec_mass_diff: True
+  nce: False
+  ace: False
+  preprocess: False
+  unique_id: True
+  counts: True
+  test_ces:
+mol_params:
+  smiles: True
+  fingerprint: False
+  fingerprint_morgan: True
+  fingerprint_rdkit: True
+  fingerprint_maccs: True
+  pyg: True
+  pyg_node_feats:
+    - a_onehot
+    - a_degree
+    - a_hybrid
+    - a_formal
+    - a_radical
+    - a_ring
+    - a_mass
+    - a_chiral
+  pyg_edge_feats:
+    - b_degree
+  pyg_pe_embed_k: 0
+  pyg_bigraph: True
+  mf: False
+  graff: False
+  preprocess: False
+frag_params:
+  pyg: True
+  pyg_node_feats:
+    - cc
+    - base_formula
+    - depth
+    - h_formulae_idx
+    # - h_counts
+    # - nb_iso_idx
+  pyg_edge_feats:
+    - cc
+    - base_formula
+    # - h_range
+  pyg_edges: True
+  pyg_bigraph: True
+  num_isotopes: 1
+  formula_peak_mzs: True
+  formula_peak_probs: True
+  formula_str: False
+  compressed: True
+  preload: False
+  preprocess: False
+magma_params:
+  pe_embed_k: 0
+  root_encode: gnn
+  add_hs: False
+  binned_targs: False
+  mz_bin_res: 0.1
+  mz_max: 1500.0
+  sum_ints: True
+  adduct_form_deltas: False
+  preprocess: False
+ann_params:
+  max_isotope: 2
+  library_size: 1000 #10000
+  num_eigs: 8
+  filter_peaks: False
+  filter_peaks_tol: 1.0
+  library_splits:
+    - train
+  formula_str: False
+  huge_mz_diff_threshold: 0.1
+  big_mz_diff_ppm_threshold:
+  library_fp:
+  preprocess: False
+# model
+model_type: frag_gnn
+num_depth: 5
+num_hs: 4
+num_elements: 12
+int_embedder: abs-sines
+int_embedder_tight: False
+output_formula_str: False
+# mol model
+mol_hidden_size: 256
+mol_num_layers: 4
+mol_gnn_type: GINE
+mol_dropout: 0.0
+mol_normalization: batch
+mol_pool_type: none
+# interstage
+cc_interstage_type: direct
+# frag model
+frag_hidden_size: 256
+frag_num_layers: 4
+frag_gnn_type: GINE
+frag_dropout: 0.0
+frag_normalization: batch
+frag_pool_type: none
+frag_embed_combine: cat
+frag_pool_combine: subtract
+# generic model
+mlp_output_format: formula
+mlp_hidden_size: 256
+mlp_dropout: 0.0
+mlp_normalization: none
+mlp_num_layers: 2
+mlp_use_residuals: True
+# bin-specific model
+ff_prec_mz_offset: 0 #5
+ff_bidirectional: True
+ff_output_map_size: -1
+ff_output_activation: relu
+# iceberg model
+iceberg_hidden_size: 256
+iceberg_num_layers: 3
+iceberg_num_set_layers: 1
+iceberg_num_frag_set_layers: 0
+iceberg_num_mlp_layers: 0
+iceberg_num_gnn_layers: 0
+iceberg_dropout: 0.0
+iceberg_gnn_type: GGNN
+iceberg_pool_type: avg
+iceberg_inject_early: False
+iceberg_embed_adduct: False
+iceberg_encode_forms: False
+iceberg_fix_batch_bug: False
+# massformer model
+mf_flag: False
+mf_pt_weight_decay: 0.0
+mf_fix_num_pt_layers: 0
+mf_reinit_num_pt_layers: -1
+mf_reinit_layernorm: True
+mf_lr_schedule: True
+mf_tot_updates: 400
+mf_warmup_frac: 0.1
+mf_high_lr: 0.0002
+mf_low_lr: 0.000000001
+# graff stuff
+graff_encoder_dim: 512
+graff_decoder_dim: 1024
+graff_encoder_depth: 6
+graff_decoder_depth: 2
+graff_eig_dim: 32
+graff_eig_depth: 2
+graff_dropout: 0.1
+graff_min_probability: 0.0
+graff_min_mz: 0.0
+# other
+lr: 0.0001
+lr_schedule: False
+weight_decay: 0.01
+lr_decay_rate: 0.95
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+optimizer: adamw
+output_distribution: gaussian
+loss_type: cross_entropy
+loss_vectorized: False
+loss_tolerance_rel: 0.00001 # 10 ppm
+loss_tolerance_abs: #0.001
+loss_batch_size: 32
+loss_tolerance_min_mz: 200.0
+bin_output: False
+auxiliary_scores:
+  - cos_sim
+  - recall
+  - wrecall
+  - opt_cos_sim
+  - true_spec_e
+  - true_spec_ne
+  - cos_hun
+  - precision
+  - ndcg
+  - jss
+  - jss_hun
+  - true_oos_prob
+  - true_oos_e
+ints_thresh: 0.0
+mz_max: 1500.0
+mz_bin_res: 0.01
+eval_mz_bin_res:
+  - 0.1
+  - 0.01
+eval_bin_sqrt: False
+eval_bin_remove_prec_peaks: False
+eval_hun_sqrt: False
+eval_hun_remove_prec_peaks: False
+sum_ints: True
+ints_transform: none
+train_batch_size: 16
+eval_batch_size: 16
+accelerator: cpu
+devices: auto
+logging:
+  - console
+  - wandb
+num_workers: 7
+pin_memory: True
+min_epochs: 1
+max_epochs: 1
+gradient_clip_val: 5.0
+gradient_clip_algorithm: norm
+accumulate_grad_batches: 1
+precision: 32 # 64, 16-mixed, bf16-mixed
+debug_overfit: False
+debug_overfit_batches: 10
+log_every_n_steps: 0
+primary_loss_weight: 1.0
+formula_entropy_weight: 0.0
+node_entropy_weight: 0.0
+node_formula_entropy_weight: 0.0
+formula_node_entropy_weight: 0.0
+joint_entropy_weight: 0.0
+formula_normalized_entropy_weight: 0.0
+node_normalized_entropy_weight: 0.0
+node_formula_normalized_entropy_weight: 0.0
+formula_node_normalized_entropy_weight: 0.0
+joint_normalized_entropy_weight: 0.0
+nb_iso: False
+nb_node_entropy_weight: 0.0
+nb_node_formula_entropy_weight: 0.0
+nb_formula_node_entropy_weight: 0.0
+nb_joint_entropy_weight: 0.0
+nb_formula_normalized_entropy_weight: 0.0
+nb_node_normalized_entropy_weight: 0.0
+nb_node_formula_normalized_entropy_weight: 0.0
+nb_formula_node_normalized_entropy_weight: 0.0
+nb_joint_normalized_entropy_weight: 0.0
+nb_node_node_entropy_weight: 0.0
+nb_node_node_normalized_entropy_weight: 0.0
+skip_edge_loss: True
+edge_h_range_loss_weight: 0.0
+edge_h_transfer_loss_weight: 0.0
+edge_h_range_loss_fn: linear # do not make exponential!
+edge_h_transfer_loss_fn: linear
+edge_entropy_weight: 0.0
+edge_normalized_entropy_weight: 0.0
+seed: 420
+detect_anomaly: False
+automatic_optimization: True
+profiler: none
+compile: True
+num_log_train_images: 0
+num_log_val_images: 0
+deterministic: False
+drop_last: False
+num_sanity_val_steps: 2
+mask_null_formula: True
+predict_oos: False
+oos_tolerance_multiple: -1
+oos_loss: False
+null_loss: False
+null_loss_weight: 1.0
+ce_insert_type: id # ce insert type ["id","lin","embed","bin"]
+ce_insert_location: none # where ce insert happens ["none","mol","frag","mlp"]
+ce_insert_merge: False # merge ce embedding
+ce_insert_size: 32
+# rough approximations from NIST20 Orbitrap/FT MS
+ce_max: 200
+ce_mean: 60
+ce_std: 40
+# rough approximations from NIST20 QToF
+# ce_mean: 20
+# ce_std: 10
+# ce_max: 60
+prec_insert_location: none
+prec_insert_size: 32
+inst_insert_location: none
+inst_insert_size: 32
+dynamic_batch_sampler: False
+dynamic_batch_sampler_mode: frag_node
+dynamic_batch_sampler_max: 100000
+group_sampler: False
+group_sampler_type: group #[group, group_mol, mol]
+group_sampler_max_per_group: 3
+simple_group_sampler: False
+simple_group_sampler_avg_per_group: 5
+simple_group_sampler_type: group #[group, group_mol, mol]
+mp_sharing_strategy: file_descriptor
+check_gradient_norm: False
+use_tensor_float32: False
+nan_module_hook: False
+debug_zero_loss: False
+checkpoint_metric: epoch
+checkpoint_metric_mode: max
+checkpoint_save_last: True
+upload_checkpoints: False
+disable_checkpoints: False
+delete_checkpoints: True
+pl_enable_progress_bar: True
+sparse_cosine_similarity: False
+debug_val_loop_trigger: False
+debug_bypass_train_val: False
+train_sample_weight: none
+eval_sample_weight: none
+log_hist_metrics: False
+track_datapoint_metrics: False
+gaussian_renormalize: False
+pm_tolerance_multiple: 3.0
+activation_checkpointing: False
+skip_extra_losses: False
+log_zero_fp16: null
+log_zero_fp32: null
+share_memory: False
+log_min: 0.000000001 # 1e-9
+eval_test_split: False

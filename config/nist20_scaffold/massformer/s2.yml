@@ -1,0 +1,76 @@
+wandb_name: nist20_scaffold_massformer_s2
+wandb_group: nist20_scaffold_massformer
+
+# seed
+seed: 444303
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_scaffold
+spec_params:
+  merge: True
+  nce: True
+  merge_keep_ces: True
+  preprocess: True
+mol_params:
+  pyg: False
+  mf: True
+  preprocess: True
+frag_params:
+  pyg: False
+
+# model stuff
+model_type: massformer
+mlp_hidden_size: 512
+mlp_dropout: 0.2
+mlp_num_layers: 1
+mlp_use_residuals: True
+ff_prec_mz_offset: 50
+ff_bidirectional: True
+ff_output_map_size: 256
+mf_flag: False
+mf_pt_weight_decay: 0.01
+mf_fix_num_pt_layers: 0
+mf_reinit_num_pt_layers: -1
+mf_reinit_layernorm: True
+mf_lr_schedule: False
+ce_insert_type: embed
+ce_insert_location: mlp
+ce_insert_merge: True
+mz_max: 1500.0
+mz_bin_res: 0.01
+sum_ints: True
+
+# loss stuff
+loss_type: cosine_distance
+sparse_cosine_similarity: True
+ints_transform: sqrt
+
+# optimization stuff
+train_batch_size: 128
+eval_batch_size: 128
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.0002572
+weight_decay: 0.0
+accelerator: gpu
+devices: 1
+min_epochs: 200
+max_epochs: 200
+lr_schedule: True
+lr_decay_rate: 0.8637
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+checkpoint_metric_mode: max
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: True

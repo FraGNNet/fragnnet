@@ -1,0 +1,96 @@
+wandb_name: entropy_d4_low_ens_s14
+wandb_group: entropy_d4_low_ens
+
+# seed stuff
+seed: 623677
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_scaffold
+frag_dp: data/frag/nist20_d4/dags
+frag_params:
+  pyg_node_feats:
+    - cc
+    - base_formula
+    - depth
+    - h_formulae_idx
+    - nb_iso_idx
+  pyg_edge_feats: []
+  pyg_edges: False
+  pyg_bigraph: False
+  preload: True
+  preprocess: True
+spec_params:
+  merge: True
+  nce: True
+  merge_keep_ces: True
+  preprocess: True
+mol_params:
+  preprocess: True
+nb_iso: True
+formula_node_normalized_entropy_weight: 0.10
+formula_normalized_entropy_weight: -0.00
+
+# model stuff
+frag_gnn_type: NodeMLP
+num_depth: 5
+num_hs: 4
+ce_insert_type: embed
+ce_insert_location: mlp
+ce_insert_merge: True
+mol_pool_type: mean
+frag_pool_type: mean
+mol_normalization: batch
+mol_hidden_size: 256
+mol_dropout: 0.3
+frag_hidden_size: 256
+frag_normalization: layer
+frag_embed_combine: cat
+frag_pool_combine: subtract
+frag_dropout: 0.4
+mlp_normalization: layer
+mlp_hidden_size: 256
+mlp_dropout: 0.3
+
+# loss stuff
+mask_null_formula: False
+predict_oos: True
+oos_tolerance_multiple: 1
+oos_loss: True
+gaussian_renormalize: True
+sparse_cosine_similarity: True
+loss_vectorized: True
+loss_batch_size: 16
+skip_extra_losses: False
+group_sampler: False
+simple_group_sampler: False
+train_sample_weight: none
+eval_sample_weight: none
+
+# optimization stuff
+train_batch_size: 128
+eval_batch_size: 128
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.00123
+weight_decay: 0.01
+accelerator: gpu
+devices: 1
+min_epochs: 200
+max_epochs: 200
+lr_schedule: False
+debug_overfit: False
+upload_checkpoints: True
+delete_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: False
+dynamic_batch_sampler: True
+pl_enable_progress_bar: True
+compile: True

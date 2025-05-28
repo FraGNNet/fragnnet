@@ -1,0 +1,65 @@
+wandb_name: nist20_scaffold_iceberg_gen_s2
+wandb_group: nist20_scaffold_iceberg_gen
+
+# seed
+seed: 444303
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_scaffold
+magma_dp: data/magma/gen/nist20mona23v3
+spec_params:
+  preprocess: True
+mol_params:
+  smiles: True
+  fingerprint: False
+  pyg: False
+  preprocess: False
+magma_params:
+  pe_embed_k: 14
+  root_encode: gnn
+  add_hs: True
+  preprocess: True
+
+# model stuff
+model_type: iceberg_gen
+iceberg_hidden_size: 512
+iceberg_num_layers: 6
+iceberg_num_set_layers: 0
+iceberg_dropout: 0.2
+iceberg_gnn_type: GGNN
+iceberg_pool_type: avg
+iceberg_inject_early: False
+iceberg_embed_adduct: True
+iceberg_encode_forms: True
+
+# loss stuff
+loss_type: iceberg_gen_cross_entropy
+
+# optimization stuff
+train_batch_size: 32
+eval_batch_size: 32
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.000996
+weight_decay: 0.0
+accelerator: gpu
+devices: 1
+min_epochs: 100
+max_epochs: 100
+lr_schedule: True
+lr_decay_rate: 0.7214
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_loss_epoch/mean
+checkpoint_metric_mode: min
+auxiliary_scores: []
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+dynamic_batch_sampler: False
+pl_enable_progress_bar: True
+compile: True

@@ -1,0 +1,44 @@
+entity: fragnnet
+project: fragnnet
+program: ~/fragnnet/scripts/run_wandb_sweep.py
+method: random
+name: d3_sweep
+description: Optimize fragnnet-D3 hyperparameters for binned cosine similarity (0.01 Da)
+metric:
+  goal: maximize
+  name: val_cos_sim_0.01_best/mean
+parameters:
+  # general optimization
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  weight_decay:
+    values: [0.,0.001,0.01,0.1]
+  train_batch_size:
+    values: [32, 64, 128, 256]
+  # mol-specific
+  mol_normalization:
+    values: [none, batch, layer, graph]
+  mol_hidden_size:
+    values: [64, 128, 256]
+  mol_dropout:
+    values: [0.0,0.1,0.2,0.3,0.4]
+  # frag-specific
+  frag_hidden_size:
+    values: [64, 128, 256]
+  frag_normalization:
+    values: [none, batch, layer, graph]
+  frag_embed_combine:
+    values: [cat, avg]
+  frag_pool_combine:
+    values: [add, subtract, none]
+  frag_dropout:
+    values: [0.0,0.1,0.2,0.3,0.4]
+  # mlp-specific
+  mlp_normalization:
+    values: [none, batch, layer]
+  mlp_hidden_size:
+    values: [64, 128, 256]
+  mlp_dropout:
+    values: [0.0,0.1,0.2,0.3,0.4]

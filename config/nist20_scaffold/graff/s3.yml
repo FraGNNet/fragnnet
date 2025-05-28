@@ -1,0 +1,88 @@
+wandb_name: nist20_scaffold_graff_s3
+wandb_group: nist20_scaffold_graff
+
+# seed
+seed: 103976
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_scaffold
+ann_fp: data/proc/nist20/ann_df.pkl
+frag_params:
+  pyg: False
+spec_params:
+  merge: True
+  nce: True
+  merge_keep_ces: True
+  preprocess: True
+mol_params:
+  pyg: False
+  graff: True
+  preprocess: True
+ann_params:
+  max_isotope: 2
+  library_size: 10000
+  num_eigs: 8
+  filter_peaks: False
+  filter_peaks_tol: 0.02
+  library_splits:
+    - train
+    - val
+    - test
+  huge_mz_diff_threshold: 0.1
+  big_mz_diff_ppm_threshold: 0.00001
+  preprocess: True
+
+# model stuff
+model_type: graff
+graff_encoder_dim: 1024
+graff_decoder_dim: 1024
+graff_encoder_depth: 6
+graff_decoder_depth: 2
+graff_eig_dim: 32
+graff_eig_depth: 2
+graff_dropout: 0.0
+graff_min_probability: 0.0
+graff_min_mz: 0.0
+ce_insert_type: embed
+ce_insert_location: mlp
+ce_insert_merge: True
+
+# loss stuff
+loss_type: cross_entropy
+output_distribution: peak_marginal
+sparse_cosine_similarity: True
+oos_loss: False
+skip_extra_losses: True
+predict_oos: False
+oos_tolerance_multiple: 1
+gaussian_renormalize: True
+pm_tolerance_multiple: 1
+
+# optimization stuff
+train_batch_size: 128
+eval_batch_size: 128
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.000254
+weight_decay: 0.000001
+accelerator: gpu
+devices: 1
+min_epochs: 200
+max_epochs: 200
+lr_schedule: True
+lr_decay_rate: 0.74
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: True

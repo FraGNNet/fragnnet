@@ -1,0 +1,78 @@
+wandb_name: nist20_inchikey_iceberg_opt_s0
+wandb_group: nist20_inchikey_iceberg_opt
+
+# seed
+seed: 397623
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_inchikey
+magma_dp: data/magma/gen/nist20mona23v3
+spec_params:
+  preprocess: True
+mol_params:
+  smiles: True
+  fingerprint: False
+  pyg: False
+  preprocess: False
+magma_params:
+  pe_embed_k: 0
+  root_encode: gnn
+  add_hs: True
+  binned_targs: False
+  mz_bin_res: 0.01
+  mz_max: 1500.0
+  sum_ints: True
+  preprocess: True
+
+# model stuff
+model_type: iceberg_inten
+iceberg_hidden_size: 512
+iceberg_num_mlp_layers: 0
+iceberg_num_gnn_layers: 2
+iceberg_num_set_layers: 0
+iceberg_num_frag_set_layers: 3
+iceberg_dropout: 0.3
+iceberg_gnn_type: GGNN
+iceberg_pool_type: avg
+iceberg_inject_early: False
+iceberg_embed_adduct: True
+iceberg_encode_forms: True
+iceberg_fix_batch_bug: True
+output_formula_str: False
+
+# loss stuff
+loss_type: cosine_distance
+oos_tolerance_multiple: 1
+oos_loss: False
+sparse_cosine_similarity: True
+ints_transform: sqrt
+
+# optimization stuff
+train_batch_size: 32
+eval_batch_size: 32
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.0003441
+weight_decay: 0.0000001
+accelerator: gpu
+devices: 1
+min_epochs: 200
+max_epochs: 200
+lr_schedule: True
+lr_decay_rate: 0.8048
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+checkpoint_metric_mode: max
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: True

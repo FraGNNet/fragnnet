@@ -1,0 +1,63 @@
+wandb_name: nist20_scaffold_precursor_s0
+wandb_group: nist20_scaffold_precursor
+
+# seed
+seed: 397623
+
+# data stuff
+spec_fp: data/proc/nist20/spec_df.pkl
+mol_fp: data/proc/nist20/mol_df.pkl
+split_dp: data/split/nist20_scaffold
+spec_params:
+  merge: True
+  nce: False
+  preprocess: True
+mol_params:
+  fingerprint: False
+  pyg: False
+frag_params:
+  pyg: False
+
+# model stuff
+model_type: precursor
+
+# loss stuff
+loss_type: cross_entropy
+mask_null_formula: False
+predict_oos: False
+oos_tolerance_multiple: 1
+oos_loss: False
+gaussian_renormalize: True
+sparse_cosine_similarity: True
+loss_vectorized: True
+loss_batch_size: 16
+skip_extra_losses: True
+group_sampler: False
+simple_group_sampler: False
+train_sample_weight: none
+eval_sample_weight: none
+
+# optimization stuff
+train_batch_size: 256
+eval_batch_size: 256
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.0
+weight_decay: 0.0
+accelerator: gpu
+devices: 1
+min_epochs: 1
+max_epochs: 1
+lr_schedule: False
+debug_overfit: False
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean
+checkpoint_metric_mode: max
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 0.01
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: False

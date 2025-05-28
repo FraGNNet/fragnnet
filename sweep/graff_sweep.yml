@@ -1,0 +1,34 @@
+entity: fragnnet
+project: fragnnet
+program: ~/fragnnet/scripts/run_wandb_sweep.py
+method: random
+name: graff_sweep
+description: Optimize GrAFF hyperparameters for binned cosine similarity (0.01 Da)
+metric:
+  goal: maximize
+  name: val_cos_sim_0.01_best/mean
+parameters:
+  # general optimization
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001 # 1e-4
+    max: 0.001 # 1e-3
+  lr_decay_rate:
+    distribution: uniform
+    min: 0.7
+    max: 1.0
+  weight_decay:
+    values: [0., 0.0000001, 0.000001, 0.00001]
+  accumulate_grad_batches:
+    values: [1, 2, 3, 4]
+  # graff-specific
+  graff_encoder_dim:
+    values: [256, 512, 1024]
+  graff_decoder_dim:
+    values: [256, 512, 1024]
+  graff_encoder_depth:
+    values: [2, 4, 6]
+  graff_decoder_depth:
+    values: [2, 4, 6]
+  graff_dropout:
+    values: [0.0, 0.1, 0.2, 0.3]

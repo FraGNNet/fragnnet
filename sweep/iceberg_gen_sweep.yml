@@ -1,0 +1,40 @@
+entity: fragnnet
+project: fragnnet
+program: ~/fragnnet/scripts/run_wandb_sweep.py
+method: random
+name: iceberg_gen_sweep
+description: Optimize ICEBERG GEN hyperparameters for loss
+metric:
+  goal: minimize
+  name: val_loss_best/mean
+parameters:
+  # general optimization
+  lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.001
+  lr_decay_rate:
+    distribution: uniform
+    min: 0.7
+    max: 1.0
+  weight_decay:
+    values: [0.000001, 0.0000001, 0]
+  train_batch_size:
+    values: [8, 16, 32, 64]
+  # iceberg-specific
+  magma_params:
+    parameters:
+      pe_embed_k:
+        distribution: int_uniform
+        min: 0
+        max: 20
+  iceberg_hidden_size:
+    values: [128, 256, 512]
+  iceberg_dropout:
+    values: [0.0, 0.1, 0.2, 0.3]
+  iceberg_num_layers:
+    values: [1, 2, 3, 4, 5, 6]
+  iceberg_pool_type:
+    values: [avg, attn]
+  iceberg_inject_early:
+    values: [False, True]
