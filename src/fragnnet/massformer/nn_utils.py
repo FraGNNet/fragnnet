@@ -1,38 +1,37 @@
+import argparse
 import logging
 import math
 from typing import *
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.hub import load_state_dict_from_url
-import torch.distributed as dist
 from torch.optim.lr_scheduler import _LRScheduler
-import argparse
-
 
 logger = logging.getLogger(__name__)
 
 PRETRAINED_MODEL_URLS = {
-  "pcqm4mv2_graphormer_base": "https://zenodo.org/record/8399738/files/checkpoint_best_pcqm4mv2.pt?download=1",
+    "pcqm4mv2_graphormer_base": "https://zenodo.org/record/8399738/files/checkpoint_best_pcqm4mv2.pt?download=1",
 }
 
 
 def load_pretrained_model(pretrained_model_name):
     if pretrained_model_name not in PRETRAINED_MODEL_URLS:
-        raise ValueError(
-            "Unknown pretrained model name %s",
-            pretrained_model_name)
+        raise ValueError("Unknown pretrained model name %s", pretrained_model_name)
     if not dist.is_initialized():
         return load_state_dict_from_url(
-            PRETRAINED_MODEL_URLS[pretrained_model_name],
-            progress=True)["model"]
+            PRETRAINED_MODEL_URLS[pretrained_model_name], progress=True
+        )["model"]
     else:
         raise ValueError("don't use distributed models")
         pretrained_model = load_state_dict_from_url(
             PRETRAINED_MODEL_URLS[pretrained_model_name],
             progress=True,
-            file_name=f"{pretrained_model_name}_{dist.get_rank()}")["model"]
+            file_name=f"{pretrained_model_name}_{dist.get_rank()}",
+        )["model"]
         dist.barrier()
         return pretrained_model
 
@@ -46,9 +45,7 @@ def get_activation_fn(activation: str) -> Callable:
         return lambda x: F.relu(x).pow(2)
     elif activation == "gelu":
         return F.gelu
-    elif activation == "gelu_fast":
-        raise NotImplementedError
-    elif activation == "gelu_accurate":
+    elif activation == "gelu_fast" or activation == "gelu_accurate":
         raise NotImplementedError
     elif activation == "tanh":
         return torch.tanh
@@ -57,21 +54,21 @@ def get_activation_fn(activation: str) -> Callable:
     elif activation == "swish":
         return torch.nn.SiLU
     else:
-        raise RuntimeError(
-            "--activation-fn {} not supported".format(activation))
+        raise RuntimeError(f"--activation-fn {activation} not supported")
 
 
 def flag_bounded(
-        model_forward,
-        perturb_shape,
-        y,
-        optimizer,
-        device,
-        criterion,
-        m=3,
-        step_size=1e-3,
-        mag=1e-3,
-        mask=None):
+    model_forward,
+    perturb_shape,
+    y,
+    optimizer,
+    device,
+    criterion,
+    m=3,
+    step_size=1e-3,
+    mag=1e-3,
+    mask=None,
+):
     assert mask is None
     model, forward, backward = model_forward
     model.train()
@@ -80,8 +77,7 @@ def flag_bounded(
         perturb = torch.FloatTensor(*perturb_shape).uniform_(-1, 1).to(device)
         perturb = perturb * mag / math.sqrt(perturb_shape[-1])
     else:
-        perturb = torch.FloatTensor(
-            *perturb_shape).uniform_(-step_size, step_size).to(device)
+        perturb = torch.FloatTensor(*perturb_shape).uniform_(-step_size, step_size).to(device)
     perturb.requires_grad_()
     out = forward(perturb)
     loss = criterion(out, y)
@@ -92,8 +88,7 @@ def flag_bounded(
         if mag > 0:
             perturb_data_norm = torch.norm(perturb_data, dim=-1).detach()
             exceed_mask = (perturb_data_norm > mag).to(perturb_data)
-            reweights = (mag / perturb_data_norm * exceed_mask +
-                         (1 - exceed_mask)).unsqueeze(-1)
+            reweights = (mag / perturb_data_norm * exceed_mask + (1 - exceed_mask)).unsqueeze(-1)
             perturb_data = (perturb_data * reweights).detach()
 
         perturb.data = perturb_data.data
@@ -106,13 +101,10 @@ def flag_bounded(
 
 
 class LRPLayerNorm(nn.LayerNorm):
-
     def forward(self, input, lrp=False):
-
         if lrp:
             # this is slow
-            reduce_dims = [i for i in range(
-                input.ndim - len(self.normalized_shape), input.ndim)]
+            reduce_dims = [i for i in range(input.ndim - len(self.normalized_shape), input.ndim)]
             e = torch.mean(input, dim=reduce_dims)
             e = e.reshape(tuple(e.shape) + tuple(1 for dim in reduce_dims))
             v = torch.var(input, dim=reduce_dims, unbiased=False)
@@ -131,16 +123,16 @@ class MultiheadAttention(nn.Module):
     """
 
     def __init__(
-            self,
-            embed_dim,
-            num_heads,
-            kdim=None,
-            vdim=None,
-            dropout=0.0,
-            bias=True,
-            self_attention=False,
-            q_noise=0.0,
-            qn_block_size=8,
+        self,
+        embed_dim,
+        num_heads,
+        kdim=None,
+        vdim=None,
+        dropout=0.0,
+        bias=True,
+        self_attention=False,
+        q_noise=0.0,
+        qn_block_size=8,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -152,17 +144,17 @@ class MultiheadAttention(nn.Module):
         self.dropout_module = nn.Dropout(dropout)
 
         self.head_dim = embed_dim // num_heads
-        assert (
-            self.head_dim * num_heads == self.embed_dim
-        ), "embed_dim must be divisible by num_heads"
-        self.scaling = self.head_dim ** -0.5
+        assert self.head_dim * num_heads == self.embed_dim, (
+            "embed_dim must be divisible by num_heads"
+        )
+        self.scaling = self.head_dim**-0.5
 
         self.self_attention = self_attention
 
         assert self.self_attention, "Only support self attention"
 
         assert not self.self_attention or self.qkv_same_dim, (
-            "Self-attention requires query, key and " "value to be of the same size"
+            "Self-attention requires query, key and value to be of the same size"
         )
 
         self.k_proj = nn.Linear(self.kdim, embed_dim, bias=bias)
@@ -193,17 +185,17 @@ class MultiheadAttention(nn.Module):
             nn.init.constant_(self.out_proj.bias, 0.0)
 
     def forward(
-            self,
-            query,
-            key: Optional[Tensor],
-            value: Optional[Tensor],
-            attn_bias: Optional[Tensor],
-            key_padding_mask: Optional[Tensor] = None,
-            need_weights: bool = True,
-            attn_mask: Optional[Tensor] = None,
-            before_softmax: bool = False,
-            need_head_weights: bool = False,
-            lrp: bool = False
+        self,
+        query,
+        key: Optional[Tensor],
+        value: Optional[Tensor],
+        attn_bias: Optional[Tensor],
+        key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[Tensor] = None,
+        before_softmax: bool = False,
+        need_head_weights: bool = False,
+        lrp: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
 
@@ -241,23 +233,11 @@ class MultiheadAttention(nn.Module):
         v = self.v_proj(query)
         q *= self.scaling
 
-        q = (
-            q.contiguous()
-            .view(tgt_len, bsz * self.num_heads, self.head_dim)
-            .transpose(0, 1)
-        )
+        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if k is not None:
-            k = (
-                k.contiguous()
-                .view(-1, bsz * self.num_heads, self.head_dim)
-                .transpose(0, 1)
-            )
+            k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         if v is not None:
-            v = (
-                v.contiguous()
-                .view(-1, bsz * self.num_heads, self.head_dim)
-                .transpose(0, 1)
-            )
+            v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
 
         assert k is not None
         assert k.size(1) == src_len
@@ -271,15 +251,12 @@ class MultiheadAttention(nn.Module):
             assert key_padding_mask.size(0) == bsz
             assert key_padding_mask.size(1) == src_len
         attn_weights = torch.bmm(q, k.transpose(1, 2))
-        attn_weights = self.apply_sparse_mask(
-            attn_weights, tgt_len, src_len, bsz)
+        attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 
-        assert list(attn_weights.size()) == [
-            bsz * self.num_heads, tgt_len, src_len]
+        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
         if attn_bias is not None:
-            attn_weights += attn_bias.view(bsz *
-                                           self.num_heads, tgt_len, src_len)
+            attn_weights += attn_bias.view(bsz * self.num_heads, tgt_len, src_len)
 
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(0)
@@ -287,14 +264,12 @@ class MultiheadAttention(nn.Module):
 
         if key_padding_mask is not None:
             # don't attend to padding symbols
-            attn_weights = attn_weights.view(
-                bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
             attn_weights = attn_weights.masked_fill(
                 key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
                 float("-inf"),
             )
-            attn_weights = attn_weights.view(
-                bsz * self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if before_softmax:
             assert not lrp
@@ -308,33 +283,23 @@ class MultiheadAttention(nn.Module):
 
         assert v is not None
         attn = torch.bmm(attn_probs, v)
-        assert list(
-            attn.size()) == [
-            bsz *
-            self.num_heads,
-            tgt_len,
-            self.head_dim]
+        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
 
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
 
         attn_weights: Optional[Tensor] = None
         if need_weights:
-            attn_weights = attn_weights_float.view(
-                bsz, self.num_heads, tgt_len, src_len
-            ).transpose(1, 0)
+            attn_weights = attn_weights_float.view(bsz, self.num_heads, tgt_len, src_len).transpose(
+                1, 0
+            )
             if not need_head_weights:
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
 
         return attn, attn_weights
 
-    def apply_sparse_mask(
-            self,
-            attn_weights,
-            tgt_len: int,
-            src_len: int,
-            bsz: int):
+    def apply_sparse_mask(self, attn_weights, tgt_len: int, src_len: int, bsz: int):
         return attn_weights
 
     def upgrade_state_dict_named(self, state_dict, name):
@@ -346,23 +311,17 @@ class MultiheadAttention(nn.Module):
                 # in_proj_weight used to be q + k + v with same dimensions
                 dim = int(state_dict[k].shape[0] / 3)
                 items_to_add[prefix + "q_proj.weight"] = state_dict[k][:dim]
-                items_to_add[prefix +
-                             "k_proj.weight"] = state_dict[k][dim: 2 * dim]
-                items_to_add[prefix +
-                             "v_proj.weight"] = state_dict[k][2 * dim:]
+                items_to_add[prefix + "k_proj.weight"] = state_dict[k][dim : 2 * dim]
+                items_to_add[prefix + "v_proj.weight"] = state_dict[k][2 * dim :]
 
                 keys_to_remove.append(k)
 
                 k_bias = prefix + "in_proj_bias"
                 if k_bias in state_dict.keys():
                     dim = int(state_dict[k].shape[0] / 3)
-                    items_to_add[prefix +
-                                 "q_proj.bias"] = state_dict[k_bias][:dim]
-                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][
-                        dim: 2 * dim
-                    ]
-                    items_to_add[prefix +
-                                 "v_proj.bias"] = state_dict[k_bias][2 * dim:]
+                    items_to_add[prefix + "q_proj.bias"] = state_dict[k_bias][:dim]
+                    items_to_add[prefix + "k_proj.bias"] = state_dict[k_bias][dim : 2 * dim]
+                    items_to_add[prefix + "v_proj.bias"] = state_dict[k_bias][2 * dim :]
 
                     keys_to_remove.append(prefix + "in_proj_bias")
 
@@ -387,26 +346,15 @@ class GraphNodeFeature(nn.Module):
     Compute node features for each node in the graph.
     """
 
-    def __init__(
-            self,
-            num_heads,
-            num_atoms,
-            num_in_degree,
-            num_out_degree,
-            hidden_dim,
-            n_layers):
+    def __init__(self, num_heads, num_atoms, num_in_degree, num_out_degree, hidden_dim, n_layers):
         super(GraphNodeFeature, self).__init__()
         self.num_heads = num_heads
         self.num_atoms = num_atoms
 
         # 1 for graph token
-        self.atom_encoder = nn.Embedding(
-            num_atoms + 1, hidden_dim, padding_idx=0)
-        self.in_degree_encoder = nn.Embedding(
-            num_in_degree, hidden_dim, padding_idx=0)
-        self.out_degree_encoder = nn.Embedding(
-            num_out_degree, hidden_dim, padding_idx=0
-        )
+        self.atom_encoder = nn.Embedding(num_atoms + 1, hidden_dim, padding_idx=0)
+        self.in_degree_encoder = nn.Embedding(num_in_degree, hidden_dim, padding_idx=0)
+        self.out_degree_encoder = nn.Embedding(num_out_degree, hidden_dim, padding_idx=0)
 
         self.graph_token = nn.Embedding(1, hidden_dim)
 
@@ -425,32 +373,29 @@ class GraphNodeFeature(nn.Module):
         # node feature + graph token
         if "token" in return_input_feats:
             embed_weight = self.atom_encoder.weight
-            token_feature_idx = int(return_input_feats[len("token"):])
-            token_feature = F.one_hot(
-                x, num_classes=embed_weight.shape[0]).float()
+            token_feature_idx = int(return_input_feats[len("token") :])
+            token_feature = F.one_hot(x, num_classes=embed_weight.shape[0]).float()
             token_feature.requires_grad = True
-            token_feature_mask = torch.zeros_like(
-                token_feature, dtype=torch.bool)
+            token_feature_mask = torch.zeros_like(token_feature, dtype=torch.bool)
             input_feats = token_feature[:, :, token_feature_idx, :]
-            token_feature_mask[:, :, token_feature_idx, :] = 1.
-            token_feature = (token_feature_mask.float() *
-                             input_feats.unsqueeze(2) +
-                             (~token_feature_mask).float() *
-                             token_feature).clone()
+            token_feature_mask[:, :, token_feature_idx, :] = 1.0
+            token_feature = (
+                token_feature_mask.float() * input_feats.unsqueeze(2)
+                + (~token_feature_mask).float() * token_feature
+            ).clone()
             atom_feature = token_feature @ embed_weight
         else:
             # [n_graph, n_node, n_tokens, n_hidden]
             atom_feature = self.atom_encoder(x)
         if "atom" in return_input_feats and return_input_feats != "atom":  # atomic_num
-            atom_feature_idx = int(return_input_feats[len("atom"):])
-            atom_feature_mask = torch.zeros_like(
-                atom_feature, dtype=torch.bool)
-            atom_feature_mask[:, :, atom_feature_idx, :] = 1.
+            atom_feature_idx = int(return_input_feats[len("atom") :])
+            atom_feature_mask = torch.zeros_like(atom_feature, dtype=torch.bool)
+            atom_feature_mask[:, :, atom_feature_idx, :] = 1.0
             input_feats = atom_feature[:, :, atom_feature_idx, :]
-            atom_feature = (atom_feature_mask.float() *
-                            input_feats.unsqueeze(2) +
-                            (~atom_feature_mask).float() *
-                            atom_feature).clone()
+            atom_feature = (
+                atom_feature_mask.float() * input_feats.unsqueeze(2)
+                + (~atom_feature_mask).float() * atom_feature
+            ).clone()
             # atom_feature[:,:,atom_feature_idx,:] = atom_feature[:,:,atom_feature_idx,:] + input_feats.clone()
         atom_feature = atom_feature.sum(dim=-2)  # [n_graph, n_node, n_hidden]
         if return_input_feats == "atom":
@@ -461,19 +406,15 @@ class GraphNodeFeature(nn.Module):
         #     node_feature += perturb
 
         node_feature = (
-            atom_feature
-            + self.in_degree_encoder(in_degree)
-            + self.out_degree_encoder(out_degree)
+            atom_feature + self.in_degree_encoder(in_degree) + self.out_degree_encoder(out_degree)
         )
         if return_input_feats == "node":
             input_feats = node_feature
             node_feature = node_feature.clone()
 
-        graph_token_feature = self.graph_token.weight.unsqueeze(
-            0).repeat(n_graph, 1, 1)
+        graph_token_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
 
-        graph_node_feature = torch.cat(
-            [graph_token_feature, node_feature], dim=1)
+        graph_node_feature = torch.cat([graph_token_feature, node_feature], dim=1)
 
         return graph_node_feature, input_feats
 
@@ -484,30 +425,26 @@ class GraphAttnBias(nn.Module):
     """
 
     def __init__(
-            self,
-            num_heads,
-            num_atoms,
-            num_edges,
-            num_spatial,
-            num_edge_dis,
-            hidden_dim,
-            edge_type,
-            multi_hop_max_dist,
-            n_layers,
+        self,
+        num_heads,
+        num_atoms,
+        num_edges,
+        num_spatial,
+        num_edge_dis,
+        hidden_dim,
+        edge_type,
+        multi_hop_max_dist,
+        n_layers,
     ):
         super(GraphAttnBias, self).__init__()
         self.num_heads = num_heads
         self.multi_hop_max_dist = multi_hop_max_dist
 
-        self.edge_encoder = nn.Embedding(
-            num_edges + 1, num_heads, padding_idx=0)
+        self.edge_encoder = nn.Embedding(num_edges + 1, num_heads, padding_idx=0)
         self.edge_type = edge_type
         if self.edge_type == "multi_hop":
-            self.edge_dis_encoder = nn.Embedding(
-                num_edge_dis * num_heads * num_heads, 1
-            )
-        self.spatial_pos_encoder = nn.Embedding(
-            num_spatial, num_heads, padding_idx=0)
+            self.edge_dis_encoder = nn.Embedding(num_edge_dis * num_heads * num_heads, 1)
+        self.spatial_pos_encoder = nn.Embedding(num_spatial, num_heads, padding_idx=0)
 
         self.graph_token_virtual_distance = nn.Embedding(1, num_heads)
 
@@ -533,10 +470,8 @@ class GraphAttnBias(nn.Module):
 
         # spatial pos
         # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
-        spatial_pos_bias = self.spatial_pos_encoder(
-            spatial_pos).permute(0, 3, 1, 2)
-        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:,
-                                                        :, 1:, 1:] + spatial_pos_bias
+        spatial_pos_bias = self.spatial_pos_encoder(spatial_pos).permute(0, 3, 1, 2)
+        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + spatial_pos_bias
 
         # reset spatial pos here
         t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
@@ -548,8 +483,7 @@ class GraphAttnBias(nn.Module):
             spatial_pos_ = spatial_pos.clone()
             spatial_pos_[spatial_pos_ == 0] = 1  # set pad to 1
             # set 1 to 1, x > 1 to x - 1
-            spatial_pos_ = torch.where(
-                spatial_pos_ > 1, spatial_pos_ - 1, spatial_pos_)
+            spatial_pos_ = torch.where(spatial_pos_ > 1, spatial_pos_ - 1, spatial_pos_)
             if self.multi_hop_max_dist > 0:
                 spatial_pos_ = spatial_pos_.clamp(0, self.multi_hop_max_dist)
                 edge_input = edge_input[:, :, :, : self.multi_hop_max_dist, :]
@@ -561,23 +495,21 @@ class GraphAttnBias(nn.Module):
             )
             edge_input_flat = torch.bmm(
                 edge_input_flat,
-                self.edge_dis_encoder.weight.reshape(
-                    -1, self.num_heads, self.num_heads
-                )[:max_dist, :, :],
+                self.edge_dis_encoder.weight.reshape(-1, self.num_heads, self.num_heads)[
+                    :max_dist, :, :
+                ],
             )
             edge_input = edge_input_flat.reshape(
                 max_dist, n_graph, n_node, n_node, self.num_heads
             ).permute(1, 2, 3, 0, 4)
-            edge_input = (
-                edge_input.sum(-2) / (spatial_pos_.float().unsqueeze(-1))
-            ).permute(0, 3, 1, 2)
+            edge_input = (edge_input.sum(-2) / (spatial_pos_.float().unsqueeze(-1))).permute(
+                0, 3, 1, 2
+            )
         else:
             # [n_graph, n_node, n_node, n_head] -> [n_graph, n_head, n_node, n_node]
-            edge_input = self.edge_encoder(
-                attn_edge_type).mean(-2).permute(0, 3, 1, 2)
+            edge_input = self.edge_encoder(attn_edge_type).mean(-2).permute(0, 3, 1, 2)
 
-        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:,
-                                                        :, 1:, 1:] + edge_input
+        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + edge_input
         graph_attn_bias = graph_attn_bias + attn_bias.unsqueeze(1)  # reset
 
         return graph_attn_bias
@@ -585,18 +517,18 @@ class GraphAttnBias(nn.Module):
 
 class GraphormerGraphEncoderLayer(nn.Module):
     def __init__(
-            self,
-            embedding_dim: int = 768,
-            ffn_embedding_dim: int = 3072,
-            num_attention_heads: int = 8,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.1,
-            activation_dropout: float = 0.1,
-            activation_fn: str = "relu",
-            export: bool = False,
-            q_noise: float = 0.0,
-            qn_block_size: int = 8,
-            init_fn: Callable = None,
+        self,
+        embedding_dim: int = 768,
+        ffn_embedding_dim: int = 3072,
+        num_attention_heads: int = 8,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        activation_dropout: float = 0.1,
+        activation_fn: str = "relu",
+        export: bool = False,
+        q_noise: float = 0.0,
+        qn_block_size: int = 8,
+        init_fn: Callable = None,
     ) -> None:
         super().__init__()
 
@@ -650,13 +582,13 @@ class GraphormerGraphEncoderLayer(nn.Module):
         return nn.Linear(input_dim, output_dim)
 
     def build_self_attention(
-            self,
-            embed_dim,
-            num_attention_heads,
-            dropout,
-            self_attention,
-            q_noise,
-            qn_block_size,
+        self,
+        embed_dim,
+        num_attention_heads,
+        dropout,
+        self_attention,
+        q_noise,
+        qn_block_size,
     ):
         return MultiheadAttention(
             embed_dim,
@@ -668,13 +600,13 @@ class GraphormerGraphEncoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            x: torch.Tensor,
-            self_attn_bias: Optional[torch.Tensor] = None,
-            self_attn_mask: Optional[torch.Tensor] = None,
-            self_attn_padding_mask: Optional[torch.Tensor] = None,
-            return_attn_mats: bool = False,
-            lrp: bool = False
+        self,
+        x: torch.Tensor,
+        self_attn_bias: Optional[torch.Tensor] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_padding_mask: Optional[torch.Tensor] = None,
+        return_attn_mats: bool = False,
+        lrp: bool = False,
     ):
         """
         LayerNorm is applied either before or after the self-attention/ffn
@@ -692,7 +624,7 @@ class GraphormerGraphEncoderLayer(nn.Module):
             need_weights=return_attn_mats,
             attn_mask=self_attn_mask,
             need_head_weights=return_attn_mats,  # true iff need_weights
-            lrp=lrp
+            lrp=lrp,
         )
         x = self.dropout_module(x)
         x = residual + x
@@ -738,35 +670,34 @@ def init_graphormer_params(module, init_layernorm=False):
 
 class GraphormerGraphEncoder(nn.Module):
     def __init__(
-            self,
-            num_atoms: int,
-            num_in_degree: int,
-            num_out_degree: int,
-            num_edges: int,
-            num_spatial: int,
-            num_edge_dis: int,
-            edge_type: str,
-            multi_hop_max_dist: int,
-            num_encoder_layers: int = 12,
-            embedding_dim: int = 768,
-            ffn_embedding_dim: int = 768,
-            num_attention_heads: int = 32,
-            dropout: float = 0.1,
-            attention_dropout: float = 0.1,
-            activation_dropout: float = 0.1,
-            layerdrop: float = 0.0,
-            encoder_normalize_before: bool = False,
-            apply_graphormer_init: bool = False,
-            activation_fn: str = "gelu",
-            embed_scale: float = None,
-            freeze_embeddings: bool = False,
-            n_trans_layers_to_freeze: int = 0,
-            export: bool = False,
-            traceable: bool = False,
-            q_noise: float = 0.0,
-            qn_block_size: int = 8,
+        self,
+        num_atoms: int,
+        num_in_degree: int,
+        num_out_degree: int,
+        num_edges: int,
+        num_spatial: int,
+        num_edge_dis: int,
+        edge_type: str,
+        multi_hop_max_dist: int,
+        num_encoder_layers: int = 12,
+        embedding_dim: int = 768,
+        ffn_embedding_dim: int = 768,
+        num_attention_heads: int = 32,
+        dropout: float = 0.1,
+        attention_dropout: float = 0.1,
+        activation_dropout: float = 0.1,
+        layerdrop: float = 0.0,
+        encoder_normalize_before: bool = False,
+        apply_graphormer_init: bool = False,
+        activation_fn: str = "gelu",
+        embed_scale: float = None,
+        freeze_embeddings: bool = False,
+        n_trans_layers_to_freeze: int = 0,
+        export: bool = False,
+        traceable: bool = False,
+        q_noise: float = 0.0,
+        qn_block_size: int = 8,
     ) -> None:
-
         super().__init__()
         self.dropout_module = nn.Dropout(dropout)
         self.layerdrop = layerdrop
@@ -844,24 +775,23 @@ class GraphormerGraphEncoder(nn.Module):
                     p.requires_grad = False
 
         if freeze_embeddings:
-            raise NotImplementedError(
-                "Freezing embeddings is not implemented yet.")
+            raise NotImplementedError("Freezing embeddings is not implemented yet.")
 
         for layer in range(n_trans_layers_to_freeze):
             freeze_module_params(self.layers[layer])
 
     def build_graphormer_graph_encoder_layer(
-            self,
-            embedding_dim,
-            ffn_embedding_dim,
-            num_attention_heads,
-            dropout,
-            attention_dropout,
-            activation_dropout,
-            activation_fn,
-            export,
-            q_noise,
-            qn_block_size,
+        self,
+        embedding_dim,
+        ffn_embedding_dim,
+        num_attention_heads,
+        dropout,
+        attention_dropout,
+        activation_dropout,
+        activation_fn,
+        export,
+        q_noise,
+        qn_block_size,
     ):
         return GraphormerGraphEncoderLayer(
             embedding_dim=embedding_dim,
@@ -877,14 +807,14 @@ class GraphormerGraphEncoder(nn.Module):
         )
 
     def forward(
-            self,
-            batched_data,
-            perturb=None,
-            last_state_only: bool = False,
-            token_embeddings: Optional[torch.Tensor] = None,
-            attn_mask: Optional[torch.Tensor] = None,
-            return_attn_mats: bool = False,
-            return_input_feats: str = ""
+        self,
+        batched_data,
+        perturb=None,
+        last_state_only: bool = False,
+        token_embeddings: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        return_attn_mats: bool = False,
+        return_input_feats: str = "",
     ) -> Tuple:
         is_tpu = False
         # compute padding mask. This is needed for multi-head attention
@@ -902,7 +832,8 @@ class GraphormerGraphEncoder(nn.Module):
             x, input_feats = token_embeddings, None
         else:
             x, input_feats = self.graph_node_feature(
-                batched_data, return_input_feats=return_input_feats)
+                batched_data, return_input_feats=return_input_feats
+            )
 
         if perturb is not None:
             assert not return_input_feats
@@ -940,7 +871,7 @@ class GraphormerGraphEncoder(nn.Module):
                 self_attn_mask=attn_mask,
                 self_attn_bias=attn_bias,
                 return_attn_mats=return_attn_mats,
-                lrp=return_input_feats != ""
+                lrp=return_input_feats != "",
             )
             if not last_state_only:
                 inner_states.append(x)
@@ -986,7 +917,7 @@ class GraphormerEncoder(nn.Module):
             encoder_normalize_before=args.encoder_normalize_before,
             apply_graphormer_init=args.apply_graphormer_init,
             activation_fn=args.activation_fn,
-            n_trans_layers_to_freeze=args.n_trans_layers_to_freeze
+            n_trans_layers_to_freeze=args.n_trans_layers_to_freeze,
         )
 
         self.share_input_output_embed = args.share_encoder_input_output_embed
@@ -996,13 +927,9 @@ class GraphormerEncoder(nn.Module):
         # Remove head is set to true during fine-tuning
         self.load_softmax = not getattr(args, "remove_head", False)
 
-        self.masked_lm_pooler = nn.Linear(
-            args.encoder_embed_dim, args.encoder_embed_dim
-        )
+        self.masked_lm_pooler = nn.Linear(args.encoder_embed_dim, args.encoder_embed_dim)
 
-        self.lm_head_transform_weight = nn.Linear(
-            args.encoder_embed_dim, args.encoder_embed_dim
-        )
+        self.lm_head_transform_weight = nn.Linear(args.encoder_embed_dim, args.encoder_embed_dim)
         self.activation_fn = get_activation_fn(args.activation_fn)
         self.layer_norm = LRPLayerNorm(args.encoder_embed_dim)  # GI Mod
 
@@ -1010,9 +937,7 @@ class GraphormerEncoder(nn.Module):
         if self.load_softmax:
             self.lm_output_learned_bias = nn.Parameter(torch.zeros(1))
             if not self.share_input_output_embed:
-                self.embed_out = nn.Linear(
-                    args.encoder_embed_dim, args.num_classes, bias=False
-                )
+                self.embed_out = nn.Linear(args.encoder_embed_dim, args.num_classes, bias=False)
             else:
                 raise NotImplementedError
 
@@ -1021,29 +946,30 @@ class GraphormerEncoder(nn.Module):
         if self.embed_out is not None:
             self.embed_out.reset_parameters()
 
-    def reinit_encoder_layer_parameters(
-            self, num_layers, reinit_layernorm=False):
+    def reinit_encoder_layer_parameters(self, num_layers, reinit_layernorm=False):
         total_num_layers = len(self.graph_encoder.layers)
 
-        def init_fn(module): return init_graphormer_params(
-            module, init_layernorm=reinit_layernorm)
+        def init_fn(module):
+            return init_graphormer_params(module, init_layernorm=reinit_layernorm)
+
         for i in range(num_layers):
             self.graph_encoder.layers[total_num_layers - 1 - i].apply(init_fn)
         self.layer_norm.apply(init_fn)
 
     def forward(
-            self,
-            batched_data,
-            perturb=None,
-            masked_tokens=None,
-            return_attn_mats=False,
-            return_input_feats="",
-            **unused):
+        self,
+        batched_data,
+        perturb=None,
+        masked_tokens=None,
+        return_attn_mats=False,
+        return_input_feats="",
+        **unused,
+    ):
         inner_states, graph_rep, attn_mats, input_feats = self.graph_encoder(
             batched_data,
             perturb=perturb,
             return_attn_mats=return_attn_mats,
-            return_input_feats=return_input_feats
+            return_input_feats=return_input_feats,
         )
         if return_attn_mats:
             assert len(attn_mats) > 0, len(attn_mats)
@@ -1057,15 +983,12 @@ class GraphormerEncoder(nn.Module):
             raise NotImplementedError
 
         x = self.layer_norm(
-            self.activation_fn(
-                self.lm_head_transform_weight(x)),
-            lrp=return_input_feats != "")
+            self.activation_fn(self.lm_head_transform_weight(x)), lrp=return_input_feats != ""
+        )
 
         # project back to size of vocabulary
         # this is always False
-        if self.share_input_output_embed and hasattr(
-                self.graph_encoder.embed_tokens, "weight"
-        ):
+        if self.share_input_output_embed and hasattr(self.graph_encoder.embed_tokens, "weight"):
             x = F.linear(x, self.graph_encoder.embed_tokens.weight)
         elif self.embed_out is not None:  # this is always None
             x = self.embed_out(x)
@@ -1087,14 +1010,14 @@ class GraphormerEncoder(nn.Module):
 
 
 class GFv2Embedder(nn.Module):
-
-    def __init__(self, 
-            gf_model_name="graphormer_base",
-            gf_pretrain_name="pcqm4mv2_graphormer_base",
-            fix_num_pt_layers=0,
-            reinit_num_pt_layers=-1,
-            reinit_layernorm=True):
-
+    def __init__(
+        self,
+        gf_model_name="graphormer_base",
+        gf_pretrain_name="pcqm4mv2_graphormer_base",
+        fix_num_pt_layers=0,
+        reinit_num_pt_layers=-1,
+        reinit_layernorm=True,
+    ):
         super().__init__()
         self.args = argparse.Namespace()
         # set up some arguments based on the model architecture
@@ -1113,7 +1036,9 @@ class GFv2Embedder(nn.Module):
                 assert self.reinit_num_pt_layers == 0
                 self.args.n_trans_layers_to_freeze = self.args.encoder_layers
             else:
-                assert self.reinit_num_pt_layers <= self.args.encoder_layers - self.fix_num_pt_layers
+                assert (
+                    self.reinit_num_pt_layers <= self.args.encoder_layers - self.fix_num_pt_layers
+                )
                 self.args.n_trans_layers_to_freeze = self.fix_num_pt_layers
         # init encoder
         self.encoder = GraphormerEncoder(self.args)
@@ -1126,24 +1051,29 @@ class GFv2Embedder(nn.Module):
             assert self.args.pretrained_model_name == "pcqm4mv2_graphormer_base"
             state_dict = load_pretrained_model(self.args.pretrained_model_name)
             self.load_state_dict(
-                {k: v for k, v in state_dict.items() if k in self.state_dict().keys()})
+                {k: v for k, v in state_dict.items() if k in self.state_dict().keys()}
+            )
             if not self.args.load_pretrained_model_output_layer:
                 self.encoder.reset_output_layer_parameters()
             if self.reinit_num_pt_layers == -1:
                 assert self.fix_num_pt_layers == 0
                 self.encoder.reinit_encoder_layer_parameters(
-                    self.args.encoder_layers, reinit_layernorm=self.reinit_layernorm)
+                    self.args.encoder_layers, reinit_layernorm=self.reinit_layernorm
+                )
             else:
-                assert self.fix_num_pt_layers <= self.args.encoder_layers - self.reinit_num_pt_layers
+                assert (
+                    self.fix_num_pt_layers <= self.args.encoder_layers - self.reinit_num_pt_layers
+                )
                 self.encoder.reinit_encoder_layer_parameters(
-                    self.reinit_num_pt_layers, reinit_layernorm=self.reinit_layernorm)
+                    self.reinit_num_pt_layers, reinit_layernorm=self.reinit_layernorm
+                )
 
     def get_split_params(self):
-
         if self.pretrain:
             pt_param_names = [
-                "encoder.graph_encoder." + k for k,
-                v in self.encoder.graph_encoder.named_parameters()]
+                "encoder.graph_encoder." + k
+                for k, v in self.encoder.graph_encoder.named_parameters()
+            ]
         else:
             pt_param_names = []
         nopt_params, pt_params = [], []
@@ -1154,21 +1084,13 @@ class GFv2Embedder(nn.Module):
                 nopt_params.append(v)
         return nopt_params, pt_params
 
-    def forward(
-            self,
-            batched_data,
-            perturb=None):
-        
+    def forward(self, batched_data, perturb=None):
         batched_node_embeds, _, _ = self.encoder(
-            batched_data,
-            perturb=perturb,
-            return_attn_mats=False,
-            return_input_feats=""
+            batched_data, perturb=perturb, return_attn_mats=False, return_input_feats=""
         )
         return batched_node_embeds[:, 0, :]
 
     def get_embed_dim(self):
-        
         return self.args.encoder_embed_dim
 
 
@@ -1191,6 +1113,7 @@ def set_data_args(args):
     args.train_epoch_shuffle = False
     args.user_data_dir = ""
 
+
 def set_graphormer_base_architecture_args(args):
     args.dropout = getattr(args, "dropout", 0.1)
     args.attention_dropout = getattr(args, "attention_dropout", 0.1)
@@ -1199,16 +1122,11 @@ def set_graphormer_base_architecture_args(args):
     args.encoder_layers = getattr(args, "encoder_layers", 6)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
-    args.share_encoder_input_output_embed = getattr(
-        args, "share_encoder_input_output_embed", False
-    )
-    args.no_token_positional_embeddings = getattr(
-        args, "no_token_positional_embeddings", False
-    )
+    args.share_encoder_input_output_embed = getattr(args, "share_encoder_input_output_embed", False)
+    args.no_token_positional_embeddings = getattr(args, "no_token_positional_embeddings", False)
     args.apply_graphormer_init = getattr(args, "apply_graphormer_init", False)
     args.activation_fn = getattr(args, "activation_fn", "gelu")
-    args.encoder_normalize_before = getattr(
-        args, "encoder_normalize_before", True)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
     if args.model_name == "graphormer_base":
         args.encoder_layers = 12
         args.encoder_attention_heads = 32
@@ -1228,36 +1146,28 @@ def set_graphormer_base_architecture_args(args):
     else:
         args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
         args.encoder_layers = getattr(args, "encoder_layers", 12)
-        args.encoder_attention_heads = getattr(
-            args, "encoder_attention_heads", 32)
-        args.encoder_ffn_embed_dim = getattr(
-            args, "encoder_ffn_embed_dim", 768)
+        args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 32)
+        args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 768)
     args.activation_fn = getattr(args, "activation_fn", "gelu")
-    args.encoder_normalize_before = getattr(
-        args, "encoder_normalize_before", True)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
     args.apply_graphormer_init = getattr(args, "apply_graphormer_init", True)
-    args.share_encoder_input_output_embed = getattr(
-        args, "share_encoder_input_output_embed", False
-    )
-    args.no_token_positional_embeddings = getattr(
-        args, "no_token_positional_embeddings", False
-    )
-    args.n_trans_layers_to_freeze = getattr(
-        args, "n_trans_layers_to_freeze", 0)
+    args.share_encoder_input_output_embed = getattr(args, "share_encoder_input_output_embed", False)
+    args.no_token_positional_embeddings = getattr(args, "no_token_positional_embeddings", False)
+    args.n_trans_layers_to_freeze = getattr(args, "n_trans_layers_to_freeze", 0)
 
 
 class PolynomialDecayLR(_LRScheduler):
-
     def __init__(
-            self,
-            optimizer,
-            warmup_updates,
-            tot_updates,
-            lr,
-            end_lr,
-            power,
-            last_epoch=-1,
-            verbose=False):
+        self,
+        optimizer,
+        warmup_updates,
+        tot_updates,
+        lr,
+        end_lr,
+        power,
+        last_epoch=-1,
+        verbose=False,
+    ):
         self.warmup_updates = warmup_updates
         self.tot_updates = tot_updates
         self.lr = lr
@@ -1274,9 +1184,7 @@ class PolynomialDecayLR(_LRScheduler):
         else:
             warmup = self.warmup_updates
             lr_range = self.lr - self.end_lr
-            pct_remaining = 1 - (self._step_count - warmup) / (
-                self.tot_updates - warmup
-            )
+            pct_remaining = 1 - (self._step_count - warmup) / (self.tot_updates - warmup)
             lr = lr_range * pct_remaining ** (self.power) + self.end_lr
         return [lr for group in self.optimizer.param_groups]
 

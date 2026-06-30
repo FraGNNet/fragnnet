@@ -1,0 +1,98 @@
+wandb_name: spectraverse_neims_original_m+ch3cooh-h_cv8
+wandb_group: spectraverse_neims_original
+wandb_tags:
+- neims
+- neims_paper       # original paper settings (no low-rank, 1 Da bins)
+- fingerprint
+- morgan4096
+- ff_bidirectional
+- standard_linear   # ff_output_map_size=-1 (not low-rank)
+- bottleneck        # neims_bottleneck_factor=0.5
+- mlp_residual
+- sqrt              # ints_transform: sqrt
+- mz_1da            # 1 Da bin resolution
+- b256              # batch size 256
+
+# Original NEIMS Configuration
+# Based on the original NEIMS paper: https://pubs.acs.org/doi/10.1021/acscentsci.9b00085
+# This config uses paper-authentic settings with standard Linear layers (not low-rank)
+
+# seed
+seed: 397623
+
+# data stuff
+spec_fp: data/proc/spectraverse/spec_df.pkl
+mol_fp: data/proc/spectraverse/mol_df.pkl
+split_dp: data/split/spectraverse_benchmark_neims_adduct/m+ch3cooh-h-/cv8
+spec_params:
+  merge: True
+  nce: False
+  merge_keep_ces: False
+  preprocess: False
+  prec_type_str: False
+  prec_types:
+    - '[M+CH3COOH-H]-'
+  inst_type: False
+mol_params:
+  fingerprint_morgan: True
+  fingerprint_rdkit: False
+  fingerprint_maccs: False
+  fingerprint: True
+  morgan_radius: 2  # Original NEIMS likely uses radius=2
+  morgan_nbits: 4096
+  rdkit_nbits: 2048
+  pyg: False
+  preprocess: False
+frag_params:
+  pyg: False
+
+# model stuff - Original NEIMS configuration
+model_type: neims
+mlp_hidden_size: 1024
+mlp_dropout: 0.1
+mlp_num_layers: 4  # Number of layers from paper
+mlp_use_residuals: True
+neims_bottleneck_factor: 0.5  # Bottleneck compression ratio from paper
+ff_prec_mz_offset: 50
+ff_bidirectional: True
+ff_output_map_size: -1  # Use standard Linear layers (original NEIMS, not low-rank)
+ff_output_activation: relu
+ce_insert_type: embed
+ce_insert_location: none
+mz_max: 1500.0
+mz_bin_res: 1.0
+sum_ints: True
+
+# loss stuff
+loss_type: cosine_distance
+sparse_cosine_similarity: True
+ints_transform: sqrt
+
+# optimization stuff
+train_batch_size: 256
+eval_batch_size: 256
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+lr: 0.0004006
+weight_decay: 0.0000001
+accelerator: gpu
+devices: 1
+min_epochs: 1
+max_epochs: 50
+lr_schedule: True
+lr_decay_rate: 0.7224
+lr_warmup_steps: 1000
+lr_decay_steps: 5000
+debug_overfit: False
+upload_checkpoints: False
+checkpoint_metric: val_cos_sim_1_epoch/mean
+checkpoint_metric_mode: max
+auxiliary_scores:
+- cos_sim
+eval_mz_bin_res:
+- 1.0
+precision: 32
+use_tensor_float32: True
+automatic_optimization: True
+compile: False
+num_workers: 4

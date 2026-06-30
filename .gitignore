@@ -1,0 +1,65 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+logs
+logs*
+# Extensions
+*.c
+src/fragnnet/frag/compute_frags.c
+src/fragnnet/massformer/algos.c
+cysignals_crash_logs
+
+# Distribution / packaging
+build/
+dist/
+.pytest_cache/
+
+# Environments
+python_env/
+FRAGGNET-GPU*/
+fragnnet-GPU*/
+wandb_venv/
+
+# Project-specific Data & Outputs
+data/
+wandb/
+wandb_exports/
+figs/
+output/*
+debug_output/
+saved_ckpts/
+saved_ckpt/
+ckpts/
+metrics.pickle
+model_eval/
+tmp_ckpt/
+job_id/
+extra/
+
+# HPC / Scripts
+jobs/
+slurm_scripts/
+
+# Containers
+containers/apptainer_images/
+containers/apptainer/
+!containers/*.def
+
+# IDEs
+.vscode/
+*.code-workspace
+
+# Specific ignored files
+/wheels/
+/scripts/debug/*.pkl
+/wandb_api_key
+
+# Others
+.github
+# Claude configuration and cache
+.claude
+.codex

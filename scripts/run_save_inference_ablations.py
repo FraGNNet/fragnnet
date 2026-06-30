@@ -128,7 +128,7 @@ if __name__ == "__main__":
 		model_to_config[ablation_model] = f"config/{ablation_dset}/{ablation_model}/s0.yml"
 		group_name = f"{ablation_dset}_{ablation_model}"
 		runs = api.runs(
-			path="frag-gnn/frag-gnn",
+			path="fragnnet/fragnnet",
 			filters={"group":group_name})
 		for run in runs:
 			seed = int(run.name.split("_")[-1].removeprefix("s"))

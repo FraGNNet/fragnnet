@@ -76,7 +76,7 @@ if __name__ == "__main__":
 		if mode != "mix":
 		
 			runs = api.runs(
-					path="frag-gnn/frag-gnn",
+					path="fragnnet/fragnnet",
 					filters={"group":f"{entropy_exp}_{split_type}_{depth}_{mode}_ens"})
 			model_to_run_id = {run.name: run.id for run in runs}
 		
@@ -90,7 +90,7 @@ if __name__ == "__main__":
 			}
 			for smode, seed_range in mode_to_seed_range.items():
 				runs = api.runs(
-						path="frag-gnn/frag-gnn",
+						path="fragnnet/fragnnet",
 						filters={"group":f"{entropy_exp}_{split_type}_{depth}_{smode}_ens"})
 				for run in runs:
 					for i in range(seed_range[0],seed_range[1]):

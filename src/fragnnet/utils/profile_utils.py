@@ -1,12 +1,21 @@
-import torch
 import os
-try:
-    from lightning.pytorch.profilers.pytorch import PyTorchProfiler, _KINETO_AVAILABLE, _PROFILER, warning_cache, tensorboard_trace_handler, rank_zero_warn, MisconfigurationException, ProfilerAction, ScheduleWrapper, Any
-except ModuleNotFoundError:
-    from pytorch_lightning.profilers.pytorch import PyTorchProfiler, _KINETO_AVAILABLE, _PROFILER, warning_cache, tensorboard_trace_handler, rank_zero_warn, MisconfigurationException, ProfilerAction, ScheduleWrapper, Any
+from typing import Any
+
+import torch
+from lightning.fabric.utilities.exceptions import MisconfigurationException
+from lightning.pytorch.profilers.pytorch import (
+    _KINETO_AVAILABLE,
+    PyTorchProfiler,
+    ScheduleWrapper,
+    warning_cache,
+)
+from lightning_utilities.core.rank_zero import rank_zero_warn
+from torch.profiler import ProfilerAction, tensorboard_trace_handler
+
+__all__ = ["MyPyTorchProfiler"]
+
 
 class MyPyTorchProfiler(PyTorchProfiler):
-
     def _init_kineto(self, profiler_kwargs: Any) -> None:
         has_schedule = "schedule" in profiler_kwargs
         self._has_on_trace_ready = "on_trace_ready" in profiler_kwargs
@@ -28,7 +37,9 @@ class MyPyTorchProfiler(PyTorchProfiler):
         activities = profiler_kwargs.get("activities", None)
         self._profiler_kwargs["activities"] = activities or self._default_activities()
         self._export_to_flame_graph = profiler_kwargs.get("export_to_flame_graph", False)
-        self._export_metrics = profiler_kwargs.get("export_metrics", ("self_cpu_time_total","self_cuda_time_total"))
+        self._export_metrics = profiler_kwargs.get(
+            "export_metrics", ("self_cpu_time_total", "self_cuda_time_total")
+        )
         # self._metric = profiler_kwargs.get("metric", "self_cuda_time_total")
         with_stack = profiler_kwargs.get("with_stack", False) or self._export_to_flame_graph
         self._profiler_kwargs["with_stack"] = with_stack
@@ -41,7 +52,9 @@ class MyPyTorchProfiler(PyTorchProfiler):
         if not _KINETO_AVAILABLE or self._emit_nvtx:
             return
 
-        if self.profiler is not None and any(action_name.endswith(func) for func in self.STEP_FUNCTIONS):
+        if self.profiler is not None and any(
+            action_name.endswith(func) for func in self.STEP_FUNCTIONS
+        ):
             assert isinstance(self.profiler, torch.profiler.profile)
             if self._schedule is not None:
                 self._schedule.pre_step(action_name)
@@ -56,23 +69,30 @@ class MyPyTorchProfiler(PyTorchProfiler):
                 self._schedule = None
                 self.profiler.schedule = torch.profiler.profiler._default_schedule_fn
 
-            def on_trace_ready(profiler: _PROFILER) -> None:
+            def on_trace_ready(profiler) -> None:
                 if self.dirpath is not None:
                     if self._export_to_chrome:
                         handler = tensorboard_trace_handler(
-                            str(self.dirpath), self._prepare_filename(action_name=action_name, extension="")
+                            str(self.dirpath),
+                            self._prepare_filename(action_name=action_name, extension=""),
                         )
                         handler(profiler)
 
                     if self._export_to_flame_graph:
                         for export_metric in self._export_metrics:
                             path = os.path.join(
-                                self.dirpath, self._prepare_filename(action_name=action_name+f".{export_metric}", extension=".stack")
+                                self.dirpath,
+                                self._prepare_filename(
+                                    action_name=action_name + f".{export_metric}",
+                                    extension=".stack",
+                                ),
                             )
                             print(path, export_metric)
                             profiler.export_stacks(path, metric=export_metric)
                 else:
-                    rank_zero_warn("The PyTorchProfiler failed to export trace as `dirpath` is None")
+                    rank_zero_warn(
+                        "The PyTorchProfiler failed to export trace as `dirpath` is None"
+                    )
 
             if not self._has_on_trace_ready:
                 self.profiler.on_trace_ready = on_trace_ready

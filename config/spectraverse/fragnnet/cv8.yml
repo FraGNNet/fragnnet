@@ -1,0 +1,219 @@
+# ============================================================================
+# W&B Logging
+# ============================================================================
+wandb_name: spectraverse_fragnnet_cv8
+wandb_group: spectraverse_fragnnet
+wandb_tags:
+- retrieval
+- fraggnn_d3
+- dynamic_sampler
+- nodemlp
+- oos_multiple_1
+- gaussian_renormalize
+- b256          # batch size 256
+- vectorized_loss
+- lb16          # loss batch size 16
+- new_no_edges  # no edge features in fragment GNN
+- skip_extra_losses
+- binned_cosine_similarity
+- m+h
+- m-h
+- m+na
+- m+cl
+- frag_mode     # HCD/CID conditioning token
+- frag_mode_scale  # mode-conditioned affine output scaling
+- ce_scale      # CE-conditioned FiLM scaler
+- nce
+- cmf           # charge-migration fragments included
+- inst_tol      # per-instrument loss tolerance
+- boundary_pair   # boundary_pair node feature in fragment GNN
+
+# ============================================================================
+# Data File Paths
+# ============================================================================
+spec_fp: data/proc/spectraverse/spec_df.pkl
+mol_fp: data/proc/spectraverse/mol_df.pkl
+split_dp: data/split/spectraverse_benchmark/cv8  # cross-validation split for spectraverse benchmark
+frag_dp: data/frag/spectraverse_ma_mi_d3_h4_isoFalse/dags  # depth-3 DAGs, ±4 H-transfers, no isotopes
+
+# ============================================================================
+# Model Architecture
+# ============================================================================
+num_depth: 4    # max fragmentation depth in DAG (depth-3 frags + root = 4 levels)
+num_hs: 4       # number of H-transfer options per fragment (0..4)
+frag_gnn_type: NodeMLP  # lightweight per-node MLP (no message-passing edges)
+mol_hidden_size: 384    # sweep: 4/5 top runs use 384 (vs default 256)
+
+# ============================================================================
+# Fragment DAG Parameters
+# ============================================================================
+frag_params:
+  pyg_node_feats:
+    - cc            # connected-component index within DAG
+    - base_formula  # molecular formula of fragment (no H)
+    - depth         # depth of fragment node in the DAG
+    - h_formulae_idx     # index into H-transfer formula table
+    - cmf_h_formulae_idx # same as above but for charge-migration fragments
+    - boundary_pair     # cut-bond pair encoding: Linear(cat(inside_atom_embed, outside_atom_embed)) pooled over cuts
+  pyg_edge_feats: []   # no edge features (new_no_edges variant)
+  pyg_edges: False     # disable edge message-passing
+  pyg_bigraph: False
+  preload: False      # load all DAGs into memory at startup for speed
+  preprocess: False   # apply preprocessing transforms at load time
+  include_cmf: True    # include charge-migration fragment nodes
+
+# ============================================================================
+# Spectrum Parameters
+# ============================================================================
+spec_params:
+  merge: False          # keep per-CE spectra separate (not merged)
+  nce: True             # use normalized collision energy (NCE) as input
+  ace: True            # do not use absolute collision energy (ACE)
+  merge_keep_ces: False
+  preprocess: False
+  prec_type_str: False  # encode precursor type as integer index, not string
+  prec_types:
+    - '[M-H]-' 
+    - '[M+H]+' 
+    - '[M+HCOOH-H]-' 
+    - '[M]+' 
+    - '[M+Na]+' 
+    - '[M+K]+' 
+    - '[M+NH4]+'
+    - '[M+CH3COOH-H]-'
+    - '[M+Cl]-'
+  inst_type: True
+  inst_types:
+    - "FT"
+    - "QTOF"
+    - 'IT'
+    - "Other"
+    - "NA"
+  frag_mode: True       # condition on fragmentation mode
+  frag_modes:           # known modes; unknown falls back to index num_frag_modes
+    - "HCD"
+    - "CID"
+
+# ============================================================================
+# Molecule Parameters
+# ============================================================================
+mol_params:
+  preprocess: False
+
+# ============================================================================
+# Conditioning Embeddings (CE / Precursor / Instrument / Frag-mode)
+# All inserted at the mol encoder input ("mol" location)
+# ============================================================================
+ce_insert_type: embed_clamped         # learned CE embedding (vs. linear/bin)
+ce_insert_location: mol       # inject into molecule encoder input
+ce_insert_merge: True         # merge embeddings when injected at multiple locations
+ce_insert_size: 32            # CE embedding dimension
+prec_insert_location: mol     # inject precursor-type embedding into molecule encoder
+prec_insert_size: 32
+inst_insert_location: mol     # inject instrument-type embedding into molecule encoder
+inst_insert_size: 32
+frag_mode_insert_location: mol  # inject frag-mode embedding into molecule encoder
+frag_mode_insert_size: 32
+frag_mode_scale: True         # enable mode-conditioned affine scaling on output logits
+ce_scale: True                # enable CE-conditioned FiLM scaler on output logits
+ce_scaler_hidden_dim: 64      # hidden dim of CE→FiLM MLP
+
+# ============================================================================
+# Training Hyperparameters
+# ============================================================================
+train_batch_size: 256
+eval_batch_size: 256
+accumulate_grad_batches: 1
+gradient_clip_val: 5.0
+accelerator: gpu
+devices: 1
+min_epochs: 100
+max_epochs: 100
+debug_overfit: False
+
+# ============================================================================
+# Regularization (all dropouts were 0.0 → overfitting gap of 0.16 at ep 99)
+# ============================================================================
+mol_dropout: 0.1    # from fragnnet_d3/s0.yml
+frag_dropout: 0.1   # from fragnnet_d3/s0.yml
+mlp_dropout: 0.3    # sweep: top runs favour 0.3
+weight_decay: 0.01
+
+# ============================================================================
+# LR Schedule — cosine warmup + decay
+# ~1300 steps/epoch × 300 epochs = ~390k total steps
+# warmup: first ~4 epochs (5000 steps); cosine decay to 1% of peak by end
+# ============================================================================
+lr_schedule: False
+lr: 0.0004
+lr_schedule_type: cosine
+lr_warmup_steps: 5000
+lr_total_steps: 390000
+lr_min_ratio: 0.01    # floor at 1% of peak LR (4e-6)
+lr_decay_rate: 0.95   # unused for cosine but required by template
+lr_decay_steps: 5000  # unused for cosine but required by template
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+mask_null_formula: False   # include null-formula peaks in loss
+predict_oos: True          # predict out-of-structure (OOS) probability
+oos_tolerance_multiple: 1  # tolerance multiplier for OOS peak matching
+oos_loss: True             # train with OOS auxiliary loss
+gaussian_renormalize: True # renormalize output with Gaussian smoothing before loss
+
+# ============================================================================
+# Spectrum Binning & Evaluation
+# ============================================================================
+mz_bin_res: 0.01           # m/z bin resolution in Da
+mz_max: 1500.0             # maximum m/z to include
+sparse_cosine_similarity: True  # use sparse dot-product for speed
+mol_pool_type: mean
+frag_pool_type: max  # sweep: top 3 runs all use max
+upload_checkpoints: True
+checkpoint_metric: val_cos_sim_0.01_epoch/mean  # metric used to select best checkpoint
+auxiliary_scores:
+  - cos_sim
+
+eval_mz_bin_res:
+  - 0.01
+eval_bin_sqrt: False  # use sqrt m/z bins for evaluation (but not training)
+
+# Per-instrument-type loss tolerance (overrides global loss_tolerance_rel)
+inst_type_loss_tol:
+  FT:    {rel: 1.0e-5, min_mz: 200.0}   # 10 ppm
+  QTOF:  {rel: 2.0e-5, min_mz: 750.0}   # 20 ppm
+  Other: {rel: 2.0e-5, min_mz: 500.0}   # 20 ppm, unknown/other instruments
+  NA:    {rel: 2.0e-5, min_mz: 500.0}   # 20 ppm, unknown instruments
+
+# ============================================================================
+# PyTorch / Lightning Options
+# ============================================================================
+precision: 32
+use_tensor_float32: True
+automatic_optimization: False  # manual optimization (custom grad-step logic in pl_model)
+dynamic_batch_sampler: True    # dynamically balance batch by fragment node count
+dynamic_batch_sampler_mode: frag_node
+dynamic_batch_sampler_max: 150000
+
+# ============================================================================
+# Group Sampler (same-molecule multi-CE batching)
+# ============================================================================
+group_sampler: False
+group_sampler_type: group
+group_sampler_max_per_group: 5
+simple_group_sampler: True              # simpler group sampler variant
+simple_group_sampler_avg_per_group: 5   # average spectra per molecule group per batch
+simple_group_sampler_type: group
+
+# ============================================================================
+# Miscellaneous
+# ============================================================================
+pl_enable_progress_bar: False
+pandarallel_enable_progress_bar: False
+activation_checkpointing: False  # disable gradient checkpointing (enough VRAM)
+compile: False                    # torch.compile for speed
+pin_memory: True
+loss_vectorized: True            # vectorized pairwise loss computation
+loss_batch_size: 16              # sub-batch size for vectorized loss
+num_workers: 6

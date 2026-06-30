@@ -181,7 +181,7 @@ if __name__ == "__main__":
 			if model_type != "precursor":
 				group_name = f"{dset}_{split_type}_{model_type}"
 				runs = api.runs(
-					path="frag-gnn/frag-gnn",
+					path="fragnnet/fragnnet",
 					filters={"group":group_name})
 				for run in runs:
 					seed = int(run.name.split("_")[-1].removeprefix("s"))
