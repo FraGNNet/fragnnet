@@ -6,7 +6,7 @@ specialized layers for molecular and spectra.
 - ZerosAggregation: Dummy aggregation module that outputs zero tensors.
 - GNN: Generic wrapper for different types of Graph Neural Networks (e.g., GINE, MPNN, GAT, GGNN).
 - GINE: Graph Isomorphism Network with Edge Features.
-- GINE_EFA: GINE augmented with per-graph EFA linear global attention.
+- GINE_GSA: GINE augmented with exact per-graph global self-attention.
 - MPNN: Neural Message Passing for Quantum Chemistry.
 - GAT: Graph Attention Networks (v1 and v2).
 - GGNN: Gated Graph Neural Networks.
@@ -23,7 +23,6 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric as pyg
-from torch.utils.checkpoint import checkpoint as th_checkpoint
 from torch_geometric.nn import aggr
 
 from fragnnet.utils.misc_utils import safelog
@@ -161,8 +160,8 @@ class GNN(nn.Module):
                 dropout=self.dropout,
                 normalization=self.normalization,
             )
-        elif self.gnn_type == "GINE_EFA":
-            self.gnn = GINE_EFA(
+        elif self.gnn_type == "GINE_GSA":
+            self.gnn = GINE_GSA(
                 hidden_size=self.hidden_size,
                 edge_feats_size=self.edge_feats_size,
                 node_feats_size=self.node_feats_size,
@@ -328,51 +327,105 @@ class GINE(nn.Module):
         return x
 
 
-def _efa_linear_attn(Q: th.Tensor, K: th.Tensor, V: th.Tensor, batch_index: th.Tensor) -> th.Tensor:
-    """Per-graph EFA linear attention on flat PyG node tensors.
+def _assert_graph_contiguous(batch_index: th.Tensor) -> None:
+    """Validate that nodes are grouped by graph in ascending order.
 
-    Uses the ELU+1 feature map, giving O(N·H·D²) complexity vs O(N²·H·D) for softmax.
-    Context is computed separately per graph via scatter_add so variable-size graphs
-    are handled correctly without padding.
+    ``to_dense_batch`` derives each node's slot from its position relative to the
+    per-graph cumulative count, so an unsorted ``batch_index`` would silently place
+    nodes in the wrong rows and scramble features rather than raise. PyG's ``Batch``
+    always produces sorted assignments; this guards against a hand-built batch.
+    """
+    if batch_index.numel() < 2:
+        return
+    is_sorted = (batch_index[1:] >= batch_index[:-1]).all()
+    message = "batch_index must be sorted so nodes are contiguous within each graph"
+    if th.compiler.is_compiling() or batch_index.device.type == "cuda":
+        th._assert_async(is_sorted, message)
+    elif not bool(is_sorted):
+        raise ValueError(message)
+
+
+def _graph_softmax_attn(
+    Q: th.Tensor,
+    K: th.Tensor,
+    V: th.Tensor,
+    batch_index: th.Tensor,
+    num_graphs: int,
+) -> th.Tensor:
+    """Exact per-graph softmax attention on flat PyG node tensors.
+
+    Nodes are packed into a dense ``(num_graphs, max_nodes, ...)`` batch so scaled
+    dot-product attention runs independently per molecule with padded keys masked out.
+
+    This replaces an ELU+1 linear-attention feature map. Linear attention costs
+    ``O(N·H·D²)`` against ``O(N²·H·D)`` for softmax, so it only pays off once a graph
+    holds more nodes than the head dimension. This encoder runs at ``head_dim`` 96 on
+    molecules whose median heavy-atom count is 20 and whose 99th percentile is 82, so
+    the crossover is never reached: the feature map had to materialize two ``(N, H, D, D)``
+    intermediates (about 144 KiB per node), measuring 2-5x slower and 15-20x heavier than
+    the exact attention below while also being an approximation.
 
     Args:
         Q: Queries of shape (N, num_heads, head_dim).
         K: Keys of shape (N, num_heads, head_dim).
         V: Values of shape (N, num_heads, head_dim).
-        batch_index: Graph assignments of shape (N,).
+        batch_index: Graph assignments of shape (N,), sorted ascending.
+        num_graphs: Number of graphs the dense batch is sized by. Passed in rather than
+            derived here so the enclosing forward pays one host sync instead of one per
+            layer.
 
     Returns:
-        Attended values of shape (N, num_heads, head_dim).
+        Attended values of shape (N, num_heads, head_dim), in the input node order.
     """
-    phi_Q = F.elu(Q) + 1  # (N, H, D)
-    phi_K = F.elu(K) + 1  # (N, H, D)
-    N, H, D = phi_Q.shape
-    num_graphs = int(batch_index.max().item()) + 1
+    _assert_graph_contiguous(batch_index)
+    num_nodes, num_heads, head_dim = Q.shape
+    dense_queries, node_mask = pyg.utils.to_dense_batch(
+        Q.reshape(num_nodes, num_heads * head_dim),
+        batch_index,
+        batch_size=num_graphs,
+    )
+    dense_keys, _ = pyg.utils.to_dense_batch(
+        K.reshape(num_nodes, num_heads * head_dim),
+        batch_index,
+        batch_size=num_graphs,
+    )
+    dense_values, _ = pyg.utils.to_dense_batch(
+        V.reshape(num_nodes, num_heads * head_dim),
+        batch_index,
+        batch_size=num_graphs,
+    )
+    max_nodes = dense_queries.shape[1]
 
-    # Accumulate outer-product KV context per graph: (G, H, D, D)
-    KV = Q.new_zeros(num_graphs, H, D, D)
-    KV_nodes = th.einsum("nhd,nhe->nhde", phi_K, V)  # (N, H, D, D)
-    KV.scatter_add_(0, batch_index.view(N, 1, 1, 1).expand_as(KV_nodes), KV_nodes)
+    def split_heads(dense: th.Tensor) -> th.Tensor:
+        return dense.view(num_graphs, max_nodes, num_heads, head_dim).transpose(1, 2)
 
-    # Accumulate key sums per graph for denominator: (G, H, D)
-    K_sum = Q.new_zeros(num_graphs, H, D)
-    K_sum.scatter_add_(0, batch_index.view(N, 1, 1).expand_as(phi_K), phi_K)
+    # Padded slots are masked as keys. A graph with no nodes would leave a row with every
+    # key masked, which softmax turns into NaN, so slot 0 is always left attendable: for a
+    # non-empty graph it already holds a real node, and for an empty graph it yields a zero
+    # row that the final mask discards anyway.
+    key_mask = node_mask.clone()
+    key_mask[:, 0] = True
+    attended = F.scaled_dot_product_attention(
+        split_heads(dense_queries),
+        split_heads(dense_keys),
+        split_heads(dense_values),
+        attn_mask=key_mask[:, None, None, :],
+    )
+    return attended.transpose(1, 2)[node_mask]
 
-    # Gather per-node context and compute normalized output
-    KV_node = KV[batch_index]  # (N, H, D, D)
-    K_sum_node = K_sum[batch_index]  # (N, H, D)
-    out = th.einsum("nhd,nhde->nhe", phi_Q, KV_node)  # (N, H, D)
-    Z = (phi_Q * K_sum_node).sum(dim=-1, keepdim=True).clamp(min=1e-6)  # (N, H, 1)
-    return out / Z
 
+class GINE_GSA(nn.Module):
+    """GINE augmented with exact per-graph global self-attention.
 
-class GINE_EFA(nn.Module):
-    """GINE augmented with per-graph EFA linear global attention.
+    After each GINEConv message-passing step, a graph-scoped attention pass mixes
+    information across all nodes in the same molecule, capturing long-range interactions
+    that local message passing misses.
 
-    After each GINEConv message-passing step, a graph-scoped linear attention pass
-    (Euclidean Fast Attention with ELU+1 feature map) mixes information across all
-    nodes in the same molecule, capturing long-range interactions that local MP misses.
-    Complexity is O(N·H·D²) instead of O(N²·H·D) for standard softmax attention.
+    This was once ``GINE_EFA``, whose global pass used an ELU+1 linear-attention feature
+    map (Euclidean Fast Attention). The attention is now exact softmax
+    (see :func:`_graph_softmax_attn` for why), so the EFA name no longer described it.
+    The rename is deliberately breaking: ``gnn_type: GINE_EFA`` and any checkpoint
+    carrying ``efa_*`` parameters now fail loudly rather than loading under changed math.
 
     Args:
         hidden_size (int): Hidden layer size.
@@ -417,17 +470,17 @@ class GINE_EFA(nn.Module):
             gine_layers.append(pyg.nn.conv.GINEConv(nn=apply_fn, eps=0.0, edge_dim=None))
         self.layers = nn.ModuleList(gine_layers)
 
-        self.efa_q = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
-        self.efa_k = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
-        self.efa_v = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
-        self.efa_out = nn.ModuleList(
+        self.gsa_q = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
+        self.gsa_k = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
+        self.gsa_v = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)])
+        self.gsa_out = nn.ModuleList(
             [nn.Linear(hidden_size, hidden_size) for _ in range(num_layers)]
         )
 
         norm_mod, norm_fn = get_norm(normalization, hidden_size)
         self.norm_fn = norm_fn
         self.norms = get_clones(norm_mod, num_layers)
-        self.efa_norms = get_clones(norm_mod, num_layers)
+        self.gsa_norms = get_clones(norm_mod, num_layers)
         self.dropouts = get_clones(nn.Dropout(dropout), num_layers)
 
     def forward(
@@ -437,7 +490,7 @@ class GINE_EFA(nn.Module):
         edge_index: th.Tensor,
         edge_attr: th.Tensor,
     ) -> th.Tensor:
-        """Forward pass: local GINEConv → global EFA → residual sum, repeated per layer.
+        """Forward pass: local GINEConv → global self-attention → residual sum, per layer.
 
         Args:
             x: Node features of shape (N, hidden_size).
@@ -449,33 +502,33 @@ class GINE_EFA(nn.Module):
             Updated node features of shape (N, hidden_size).
         """
         edge_attr = self.edge_transform(edge_attr)
-        for dropout, layer, norm, efa_norm, q_proj, k_proj, v_proj, out_proj in zip(
+        # One host sync for the whole encoder instead of one per attention pass.
+        num_graphs = int(batch_index.max().item()) + 1
+        for dropout, layer, norm, gsa_norm, q_proj, k_proj, v_proj, out_proj in zip(
             self.dropouts,
             self.layers,
             self.norms,
-            self.efa_norms,
-            self.efa_q,
-            self.efa_k,
-            self.efa_v,
-            self.efa_out,
+            self.gsa_norms,
+            self.gsa_q,
+            self.gsa_k,
+            self.gsa_v,
+            self.gsa_out,
         ):
             # Local message passing (same residual pattern as GINE)
             local_out = layer(x, edge_index, edge_attr)
             local_out = self.norm_fn(local_out, batch_index, norm)
             local_out = F.relu(dropout(local_out)) + x
 
-            # Global linear attention within each graph
+            # Exact global self-attention within each graph
             N, C = local_out.shape
             Q = q_proj(local_out).view(N, self.num_heads, self.head_dim)
             K = k_proj(local_out).view(N, self.num_heads, self.head_dim)
             V = v_proj(local_out).view(N, self.num_heads, self.head_dim)
-            efa_out = th_checkpoint(
-                _efa_linear_attn, Q, K, V, batch_index, use_reentrant=False
-            ).reshape(N, C)
-            efa_out = dropout(out_proj(F.relu(efa_out)))
-            efa_out = self.norm_fn(efa_out, batch_index, efa_norm)
+            gsa_out = _graph_softmax_attn(Q, K, V, batch_index, num_graphs).reshape(N, C)
+            gsa_out = dropout(out_proj(F.relu(gsa_out)))
+            gsa_out = self.norm_fn(gsa_out, batch_index, gsa_norm)
 
-            x = local_out + efa_out
+            x = local_out + gsa_out
         return x
 
 
@@ -948,9 +1001,7 @@ class SpecFFN(nn.Module):
         return pred_mzs, pred_logprobs, pred_batch_idxs, pred_specs
 
 
-def _pack_variable_length(
-    x: th.Tensor, batch_idx: th.Tensor
-) -> tuple[th.Tensor, th.Tensor]:
+def _pack_variable_length(x: th.Tensor, batch_idx: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
     """Pack flat (total, dim) into padded (batch, max_len, dim) with boolean mask.
 
     Args:
@@ -965,9 +1016,7 @@ def _pack_variable_length(
     set_sizes = batch_idx.bincount(minlength=batch_size)  # (batch_size,)
     max_size = int(set_sizes.max().item())
 
-    cum_starts = th.cat(
-        [th.zeros(1, dtype=th.long, device=x.device), set_sizes.cumsum(0)[:-1]]
-    )
+    cum_starts = th.cat([th.zeros(1, dtype=th.long, device=x.device), set_sizes.cumsum(0)[:-1]])
     local_pos = th.arange(x.shape[0], device=x.device) - cum_starts[batch_idx]
 
     x_padded = x.new_zeros(batch_size, max_size, x.shape[-1])
@@ -1055,9 +1104,7 @@ class _ISAB(nn.Module):
         self.mab_i = _MAB(dim, num_heads, dropout)  # I <- X
         self.mab_x = _MAB(dim, num_heads, dropout)  # X <- H
 
-    def forward(
-        self, X: th.Tensor, x_padding_mask: th.Tensor | None = None
-    ) -> th.Tensor:
+    def forward(self, X: th.Tensor, x_padding_mask: th.Tensor | None = None) -> th.Tensor:
         """Args:
             X: Input of shape (B, N, dim).
             x_padding_mask: Boolean mask (B, N), True = padding.
@@ -1081,9 +1128,7 @@ class _PMA(nn.Module):
         dropout: Dropout rate.
     """
 
-    def __init__(
-        self, dim: int, num_heads: int, num_seeds: int = 1, dropout: float = 0.1
-    ) -> None:
+    def __init__(self, dim: int, num_heads: int, num_seeds: int = 1, dropout: float = 0.1) -> None:
         super().__init__()
         self.seeds = nn.Parameter(th.randn(1, num_seeds, dim))
         self.mab = _MAB(dim, num_heads, dropout)

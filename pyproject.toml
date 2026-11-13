@@ -28,7 +28,6 @@ dependencies = [
     "pyteomics",
     "omegaconf",
     "h5py",
-    "lmdb==1.7.5",
     "pandarallel",
     "pyopenms",
 ]

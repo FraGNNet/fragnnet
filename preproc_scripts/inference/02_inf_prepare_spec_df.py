@@ -28,6 +28,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def ion_mode_from_prec_type(prec_type: str) -> str:
+    """Infer the ion-mode token ("P"/"N") from a precursor type string.
+
+    Derived from the precursor charge rather than hardcoded, so negative adducts
+    (e.g. ``[M-H]-``, ``[M+Cl]-``) are correctly labelled "N". Downstream filters
+    such as ``filter_spec_mol(..., ion_modes=[...])`` select on this column, so a
+    wrong value silently drops every spectrum of that mode.
+
+    EI maps to "P", matching ``NIST_EI_ION_MODE`` in ``01_prepare_df.py``
+    (``data_utils.get_charge`` returns +1 for "EI").
+    """
+    charge = data_utils.get_charge(prec_type)
+    if charge == 0:
+        raise ValueError(f"Could not infer ion mode from neutral precursor type: {prec_type}")
+    return "P" if charge > 0 else "N"
+
+
 def create_spec_df(mol_df: pd.DataFrame, config_d: dict[str, Any]) -> pd.DataFrame:
     """
     Create spec_df from mol_df and configuration dictionary.
@@ -52,6 +69,15 @@ def create_spec_df(mol_df: pd.DataFrame, config_d: dict[str, Any]) -> pd.DataFra
     spec_entries = []
     spec_id = 0
     group_id = 0
+
+    # Resolve ion_mode once per precursor type rather than once per spectrum row
+    # (this loop emits num_molecules * num_combinations rows). Doing it up front also
+    # fails fast on an unparseable adduct, before any work is done.
+    ion_mode_by_prec_type = {
+        combo["prec_type"]: ion_mode_from_prec_type(combo["prec_type"])
+        for combo in config_d["combinations"]
+    }
+    logger.info(f"Resolved ion modes: {ion_mode_by_prec_type}")
 
     # Ensure mol_df has mol_id as index or use it if it's a column
     if "mol_id" in mol_df.columns:
@@ -91,7 +117,7 @@ def create_spec_df(mol_df: pd.DataFrame, config_d: dict[str, Any]) -> pd.DataFra
                     "peaks": [],  # Empty peaks list for prediction
                     "frag_mode": "CID",  # Default fragmentation mode
                     "spec_type": "MS2",  # Default spectrum type
-                    "ion_mode": "P",  # Positive mode default
+                    "ion_mode": ion_mode_by_prec_type[prec_type],
                     "formula": mol_row["formula"],
                     "inchikey": mol_row["inchikey_s"],
                     "exact_mw": mol_row["exact_mw"],

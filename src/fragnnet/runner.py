@@ -278,7 +278,7 @@ def validate_sampler_config(config_d: dict) -> None:
         )
 
     if config_d["dynamic_batch_sampler"]:
-        if config_d["model_type"] != "frag_gnn":
+        if config_d["model_type"] not in ("frag_gnn", "fragnnet"):
             raise ValueError("Dynamic batch sampler can only be used with frag_gnn model")
         if config_d["automatic_optimization"]:
             raise ValueError(
@@ -294,7 +294,7 @@ def validate_sampler_config(config_d: dict) -> None:
             raise ValueError("Dynamic batch sampler requires dynamic_batch_sampler_max to be set")
 
     if config_d["dual_group_dynamic_batch_sampler"]:
-        if config_d["model_type"] != "frag_gnn":
+        if config_d["model_type"] not in ("frag_gnn", "fragnnet"):
             raise ValueError(
                 "Dual-group dynamic batch sampler can only be used with frag_gnn model"
             )
@@ -484,7 +484,9 @@ def init_run(
         # copy the checkpoint files
         old_ckpt_fps = glob.glob(os.path.join(old_wandb_dp, "ckpt", "*.ckpt"))
         if not old_ckpt_fps:
-            logging.warning(f"Resume requested but no checkpoints found in {old_wandb_dp}/ckpt/, starting from scratch")
+            logging.warning(
+                f"Resume requested but no checkpoints found in {old_wandb_dp}/ckpt/, starting from scratch"
+            )
         for old_ckpt_fp in old_ckpt_fps:
             new_ckpt_fp = os.path.join(ckpt_dp, os.path.basename(old_ckpt_fp))
             # modify checkpoint metadata (hacky)
@@ -678,7 +680,9 @@ def init_run(
             if os.path.isfile(ckpt_fp):
                 logging.info(f"resuming from checkpoint: {ckpt_fp}")
             else:
-                logging.warning(f"Resume requested but last.ckpt not found in {ckpt_dp}, starting from epoch 0")
+                logging.warning(
+                    f"Resume requested but last.ckpt not found in {ckpt_dp}, starting from epoch 0"
+                )
                 ckpt_fp = None
         else:
             ckpt_fp = None

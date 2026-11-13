@@ -162,7 +162,8 @@ def decompile_jit_ckpt(ckpt: dict[str, Any]) -> dict[str, Any]:
     # https://github.com/pytorch/pytorch/issues/101107#issuecomment-1801128683
     # print(f"> src: {path}")
 
-    if ckpt["hyper_parameters"]["compile"] == False:
+    # Checkpoints predating the compile option are uncompiled by default.
+    if not ckpt["hyper_parameters"].get("compile", False):
         return ckpt
 
     in_state_dict = ckpt["state_dict"]

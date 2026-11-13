@@ -1250,6 +1250,82 @@ def clip_loss(spectrum_embeddings, mol_embeddings, temperature=0.07):
     return loss
 
 
+def siglip_loss(
+    spectrum_embeddings: th.Tensor,
+    mol_embeddings: th.Tensor,
+    temperature: float = 0.07,
+) -> th.Tensor:
+    """Compute the SigLIP contrastive loss between spectrum and molecule embeddings.
+
+    Uses per-pair sigmoid instead of row-wise softmax, so each pair's gradient is
+    independent of batch size. Positive pairs (diagonal) are pushed toward +1,
+    all other pairs toward 0.
+
+    Embeddings must be L2-normalized before calling this function.
+
+    Args:
+        spectrum_embeddings: Shape (N, D), L2-normalized.
+        mol_embeddings: Shape (N, D), L2-normalized.
+        temperature: Logit scaling factor.
+
+    Returns:
+        Scalar loss.
+    """
+    logits = spectrum_embeddings @ mol_embeddings.t() / temperature  # (N, N)
+    n = logits.shape[0]
+    # +1 on diagonal (positive pairs), -1 off-diagonal (negative pairs)
+    labels = 2.0 * th.eye(n, device=logits.device, dtype=logits.dtype) - 1.0
+    return -F.logsigmoid(labels * logits).mean()
+
+
+def soft_clip_loss(
+    spectrum_embeddings: th.Tensor,
+    mol_embeddings: th.Tensor,
+    mol_fps: th.Tensor,
+    temperature: float = 0.07,
+) -> th.Tensor:
+    """Compute CLIP loss with soft Tanimoto similarity targets.
+
+    Instead of one-hot positives, uses row-normalized pairwise Tanimoto similarity
+    between molecular fingerprints as the target distribution. Structurally similar
+    molecules get non-zero target probability, avoiding incorrect penalization of
+    near-duplicate negatives.
+
+    Embeddings must be L2-normalized before calling this function.
+
+    Args:
+        spectrum_embeddings: Shape (N, D), L2-normalized.
+        mol_embeddings: Shape (N, D), L2-normalized.
+        mol_fps: Shape (N, fp_dim), binary (0/1) float fingerprints.
+        temperature: Logit scaling factor.
+
+    Returns:
+        Scalar loss.
+    """
+    # Tanimoto similarity matrix: intersection / union for binary fps
+    dots = mol_fps @ mol_fps.t()  # (N, N) intersection counts
+    norms = mol_fps.sum(dim=1)  # (N,) set-bit counts
+    union = norms[:, None] + norms[None, :] - dots
+    mol_sim = dots / union.clamp_min(1.0)  # (N, N) in [0, 1]
+
+    # Subtract row minimum to spread the dynamic range before normalizing.
+    # Raw Tanimoto similarities in a random batch cluster near 0, making the
+    # row-normalized targets nearly uniform and the loss degenerate (stuck at
+    # log N regardless of model output). Subtracting the row min shifts each
+    # row so that the least-similar entry becomes 0, amplifying relative
+    # differences between columns.
+    mol_sim = (mol_sim - mol_sim.min(dim=1, keepdim=True).values).clamp_min(0.0)
+
+    # Row-normalize to probability distribution
+    targets = mol_sim / mol_sim.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    logits_per_spec = spectrum_embeddings @ mol_embeddings.t() / temperature
+    logits_per_mol = logits_per_spec.t()
+    loss_s2m = -(targets * F.log_softmax(logits_per_spec, dim=1)).sum(dim=1).mean()
+    loss_m2s = -(targets * F.log_softmax(logits_per_mol, dim=1)).sum(dim=1).mean()
+    return (loss_s2m + loss_m2s) / 2.0
+
+
 ###########################################
 # Pairwise loss functions
 ###########################################
@@ -1896,3 +1972,126 @@ def _compute_pair_ce_hun(
     # CE = - Total Score
     ce = -total_score
     return ce
+
+
+def get_cross_jss_contrastive(
+    true_mzs: th.Tensor,
+    true_logprobs: th.Tensor,
+    true_batch_idxs: th.Tensor,
+    pred_mzs: th.Tensor,
+    pred_logprobs: th.Tensor,
+    pred_batch_idxs: th.Tensor,
+    batch_size: int,
+    mz_max: float,
+    mz_bin_res: float,
+    temperature: float = 0.07,
+    sqrt_transform: bool = True,
+    chunk_size: int = 32,
+) -> th.Tensor:
+    """Cross-matrix JSS contrastive loss for retrieval-aligned training.
+
+    Computes a [batch_size, batch_size] similarity matrix where row i uses the
+    real spectrum of molecule i and column j uses the predicted spectrum of
+    molecule j:
+
+        S_ij = JSS-sqrt(real_i, pred_j)
+
+    A contrastive (InfoNCE) loss is then applied row-wise so that the correct
+    candidate (diagonal) is ranked above all wrong candidates (off-diagonal).
+    This directly optimises the retrieval gap that standard per-sample losses
+    never see.
+
+    Args:
+        true_mzs: Real spectrum m/z values.
+        true_logprobs: Real spectrum log-intensities (L1-normalised, no sqrt).
+        true_batch_idxs: Batch indices for real peaks.
+        pred_mzs: Predicted m/z values.
+        pred_logprobs: Predicted log-probabilities from the model.
+        pred_batch_idxs: Batch indices for predicted peaks.
+        batch_size: Number of spectra in the batch.
+        mz_max: Maximum m/z for binning.
+        mz_bin_res: Bin resolution for binning.
+        temperature: InfoNCE temperature. Lower values make the loss sharper.
+        sqrt_transform: If True, apply sqrt-then-renormalise to both spectra
+            before computing JSS so the metric matches JSS-sqrt retrieval.
+            Set to False only if inputs are already sqrt-transformed.
+        chunk_size: Row chunk size for the [B, B] H_M computation.
+
+    Returns:
+        Per-sample contrastive loss of shape [batch_size].
+    """
+    batch_size = int(batch_size)
+    device = true_logprobs.device
+    dtype = true_logprobs.dtype
+
+    if true_mzs.numel() == 0 or pred_mzs.numel() == 0:
+        return th.zeros(batch_size, device=device, dtype=dtype)
+
+    # Bin both spectra into sparse COO representation
+    true_bin_idxs, true_bin_lp, true_bin_bidxs = batched_bin_func(
+        true_mzs, true_logprobs, true_batch_idxs,
+        mz_max=mz_max, mz_bin_res=mz_bin_res, agg="lse", sparse=True,
+    )
+    pred_bin_idxs, pred_bin_lp, pred_bin_bidxs = batched_bin_func(
+        pred_mzs, pred_logprobs, pred_batch_idxs,
+        mz_max=mz_max, mz_bin_res=mz_bin_res, agg="lse", sparse=True,
+    )
+
+    # L1-normalise
+    true_lp = scatter_logsoftmax(true_bin_lp, true_bin_bidxs)
+    pred_lp = scatter_logsoftmax(pred_bin_lp, pred_bin_bidxs)
+
+    # Optional sqrt-then-renormalise: log(sqrt(p)) = 0.5*log(p), then re-normalise
+    if sqrt_transform:
+        true_lp_half = 0.5 * true_lp
+        true_lp = true_lp_half - scatter_logsumexp(true_lp_half, true_bin_bidxs)[true_bin_bidxs]
+        pred_lp_half = 0.5 * pred_lp
+        pred_lp = pred_lp_half - scatter_logsumexp(pred_lp_half, pred_bin_bidxs)[pred_bin_bidxs]
+
+    true_probs = true_lp.exp()
+    pred_probs = pred_lp.exp()
+
+    # Strip batch offsets and build a shared compact bin space across both sets
+    num_bins = validate_bin_geometry(mz_max, mz_bin_res)
+    true_intra = true_bin_idxs % num_bins
+    pred_intra = pred_bin_idxs % num_bins
+
+    all_intra = th.cat([true_intra, pred_intra])
+    unique_bins = th.unique(all_intra)
+    K = unique_bins.numel()
+    bin_idx_map = th.full(
+        (int(all_intra.max().item()) + 1,), -1, device=device, dtype=th.long
+    )
+    bin_idx_map[unique_bins] = th.arange(K, device=device, dtype=th.long)
+    true_compact = bin_idx_map[true_intra]
+    pred_compact = bin_idx_map[pred_intra]
+
+    # Dense [B, K] probability matrices
+    P = true_probs.new_zeros((batch_size, K))
+    P[true_bin_bidxs, true_compact] = true_probs
+    Q = pred_probs.new_zeros((batch_size, K))
+    Q[pred_bin_bidxs, pred_compact] = pred_probs
+
+    # Per-spectrum entropies [B]
+    H_P = -(P * th.log(P + EPS)).sum(dim=1)
+    H_Q = -(Q * th.log(Q + EPS)).sum(dim=1)
+
+    # Cross H_M[i,j] = H(0.5*(P[i] + Q[j])) — no symmetry since P ≠ Q, full [B,B]
+    effective_chunk = batch_size if (chunk_size is None or chunk_size >= batch_size) else chunk_size
+    H_M = th.zeros((batch_size, batch_size), device=device, dtype=dtype)
+    for i in range(0, batch_size, effective_chunk):
+        i_end = min(i + effective_chunk, batch_size)
+        P_i = P[i:i_end]  # [ci, K]
+        for j in range(0, batch_size, effective_chunk):
+            j_end = min(j + effective_chunk, batch_size)
+            Q_j = Q[j:j_end]  # [cj, K]
+            M = 0.5 * (P_i.unsqueeze(1) + Q_j.unsqueeze(0))  # [ci, cj, K]
+            H_M[i:i_end, j:j_end] = -(M * th.log(M + EPS)).sum(dim=2)
+
+    # JSS [B, B]: rows = real spectra, cols = predicted spectra
+    JSD = H_M - 0.5 * H_P.unsqueeze(1) - 0.5 * H_Q.unsqueeze(0)
+    JSS = th.clamp(1.0 - JSD / math.log(2.0), min=0.0, max=1.0)
+
+    # InfoNCE: for each real spectrum (row), rank its own correct prediction highest
+    labels = th.arange(batch_size, device=device, dtype=th.long)
+    return F.cross_entropy(JSS / temperature, labels, reduction="none")  # [B]

@@ -26,14 +26,28 @@ Tests cover:
     Previously, sub-fragments containing [N+](=O)[O-] would receive "" at slot 0
     even when the parent molecule's root formula was correct — affecting 82% of
     nitro-containing molecules in NIST20 at the sub-fragment level.
+12. Bond-free (single-atom) molecules such as C, F and [SiH4]: mol_d["bonds"]
+    must stay 2-D and every atom must appear in atoms_to_bonds, otherwise
+    update_bonds raises "Buffer has wrong number of dimensions (expected 2,
+    got 1)" and the DAG for the whole molecule is discarded.
+14. formula_peak_mzs column 0 must be the monoisotopic mass.  compute_dags sorts
+    the isotope peaks by abundance before truncating to MAX_NUM_MZS_PER_FORMULA, and
+    the dataset reads only formula_peak_mzs[:, :num_isotopes] with num_isotopes=1, so
+    isotopes=True silently hands the model M+2 for any fragment with >=3 Cl / >=2 Br.
+13. Isotope-labeled atoms ([13C], [15N], [2H], ...) are rejected.  Formulae and
+    masses are monoisotopic per element, so the label was silently dropped and
+    '[13CH3]O' yielded exactly the formulae and m/z of 'CO'.
 """
 
 from __future__ import annotations
+
+import re
 
 import numpy as np
 import pytest
 
 from fragnnet.frag.compute_frags import MASK_DTYPE
+from fragnnet.utils.formula_utils import PERIODIC_TABLE, parse_formula
 from fragnnet.utils.frag_utils import (
     ELEMENT_TO_IDX,
     FRAG_INDEX_DTYPE,
@@ -42,7 +56,6 @@ from fragnnet.utils.frag_utils import (
     compute_dags,
     extract_mol_info,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,7 +87,7 @@ def _run_compute_dags(smiles: str, max_depth: int = 3) -> dict:
     "smiles",
     [
         "BrCCNc1ccccc1",  # N-phenyl-2-bromoethylamine
-        "BrCCC1CCCCN1",   # 1-(3-bromopropyl)piperidine
+        "BrCCC1CCCCN1",  # 1-(3-bromopropyl)piperidine
     ],
 )
 def test_compute_dags_brominated_molecule_no_keyerror(smiles: str) -> None:
@@ -132,9 +145,18 @@ def test_compute_dags_attaches_boundary_pair_cache() -> None:
     assert hasattr(dag, "boundary_pair_frag_idxs")
     assert hasattr(dag, "boundary_pair_in_local")
     assert hasattr(dag, "boundary_pair_out_local")
-    assert dag.boundary_pair_frag_idxs.dtype == np.dtype(np.int64) or str(dag.boundary_pair_frag_idxs.dtype) == "torch.int64"
-    assert dag.boundary_pair_in_local.dtype == np.dtype(np.int64) or str(dag.boundary_pair_in_local.dtype) == "torch.int64"
-    assert dag.boundary_pair_out_local.dtype == np.dtype(np.int64) or str(dag.boundary_pair_out_local.dtype) == "torch.int64"
+    assert (
+        dag.boundary_pair_frag_idxs.dtype == np.dtype(np.int64)
+        or str(dag.boundary_pair_frag_idxs.dtype) == "torch.int64"
+    )
+    assert (
+        dag.boundary_pair_in_local.dtype == np.dtype(np.int64)
+        or str(dag.boundary_pair_in_local.dtype) == "torch.int64"
+    )
+    assert (
+        dag.boundary_pair_out_local.dtype == np.dtype(np.int64)
+        or str(dag.boundary_pair_out_local.dtype) == "torch.int64"
+    )
     assert dag.boundary_pair_frag_idxs.shape == dag.boundary_pair_in_local.shape
     assert dag.boundary_pair_frag_idxs.shape == dag.boundary_pair_out_local.shape
 
@@ -172,9 +194,7 @@ def test_diff_cc_mask_signed_subtraction_correct() -> None:
     from_mask = np.array([1, 1, 1, 0], dtype=MASK_DTYPE)
     to_mask = np.array([0, 1, 0, 0], dtype=MASK_DTYPE)
 
-    diff = np.clip(
-        from_mask.astype(np.int16) - to_mask.astype(np.int16), 0, 1
-    ).astype(MASK_DTYPE)
+    diff = np.clip(from_mask.astype(np.int16) - to_mask.astype(np.int16), 0, 1).astype(MASK_DTYPE)
     atom_ids = cc_bit_mask_to_atom_idx(diff)
 
     # Atoms 0 and 2 are in from but not to; atom 1 is in both; atom 3 in neither
@@ -189,7 +209,7 @@ def test_diff_cc_mask_signed_subtraction_correct() -> None:
 def test_frag_index_dtype_is_uint32() -> None:
     """FRAG_INDEX_DTYPE must be np.uint32, not uint16, to support molecules
     with more than 65535 unique fragment formulae."""
-    assert FRAG_INDEX_DTYPE == np.uint32, (
+    assert np.uint32 == FRAG_INDEX_DTYPE, (
         f"Expected np.uint32, got {FRAG_INDEX_DTYPE}. "
         "uint16 max (65535) can be exceeded by molecules with many unique fragments."
     )
@@ -232,9 +252,7 @@ def test_base_formula_formula_strings_correct() -> None:
     dag_d = _run_compute_dags("CCO")
     # idx_to_formula: {int_idx: formula_str}
     formulae = set(dag_d["idx_to_formula"].values())
-    assert "C2H6O" in formulae, (
-        f"Expected 'C2H6O' in formula set for CCO, got {formulae}"
-    )
+    assert "C2H6O" in formulae, f"Expected 'C2H6O' in formula set for CCO, got {formulae}"
 
 
 # ---------------------------------------------------------------------------
@@ -331,17 +349,17 @@ def test_smarts_prepass_without_multi_cut_bfs_works() -> None:
     "smiles,expected_formula",
     [
         # Single nitro + N-methyl: floor overcount = 1 (1 O= blocked by N+ diff=0)
-        ("Cn1cnc([N+](=O)[O-])c1",                                    "C4H5N3O2"),
-        ("Cn1cnc([N+](=O)[O-])n1",                                    "C3H4N4O2"),
+        ("Cn1cnc([N+](=O)[O-])c1", "C4H5N3O2"),
+        ("Cn1cnc([N+](=O)[O-])n1", "C3H4N4O2"),
         # Single nitro + N-CH2Cl
-        ("O=[N+]([O-])c1nn(CCl)cc1Cl",                               "C4H3Cl2N3O2"),
+        ("O=[N+]([O-])c1nn(CCl)cc1Cl", "C4H3Cl2N3O2"),
         # Two nitro groups + methoxy
-        ("COc1nc(OC)c([N+](=O)[O-])cc1[N+](=O)[O-]",                 "C7H7N3O6"),
-        ("COc1n[n+]([O-])c([N+](=O)[O-])cc1[N+](=O)[O-]",            "C5H4N4O6"),
+        ("COc1nc(OC)c([N+](=O)[O-])cc1[N+](=O)[O-]", "C7H7N3O6"),
+        ("COc1n[n+]([O-])c([N+](=O)[O-])cc1[N+](=O)[O-]", "C5H4N4O6"),
         # Three nitro groups + methoxy
-        ("COc1ccc([N+](=O)[O-])c([N+](=O)[O-])c1[N+](=O)[O-]",      "C7H5N3O7"),
+        ("COc1ccc([N+](=O)[O-])c([N+](=O)[O-])c1[N+](=O)[O-]", "C7H5N3O7"),
         # Sanity: molecule without nitro must also work
-        ("CCO",                                                        "C2H6O"),
+        ("CCO", "C2H6O"),
     ],
 )
 def test_nitro_root_formula_in_dag(smiles: str, expected_formula: str) -> None:
@@ -383,10 +401,10 @@ def test_nitro_root_formula_in_dag(smiles: str, expected_formula: str) -> None:
     [
         # Nitro group — sub-fragments retaining [N+](=O)[O-] previously got ""
         # at delta_h=0 due to H-floor overcounting in compute_cc_h_floor.
-        "Cn1cnc([N+](=O)[O-])c1",           # 1-methylimidazole-4-carbaldehyde nitro
-        "O=[N+]([O-])c1ccccc1CC",            # nitrobenzene + ethyl: aryl-C cut leaves nitrophenyl sub-frag
-        "COc1ccc([N+](=O)[O-])cc1CCC",       # methoxy-nitrophenyl + propyl chain
-        "COc1nc(OC)c([N+](=O)[O-])cc1[N+](=O)[O-]",   # two nitro groups
+        "Cn1cnc([N+](=O)[O-])c1",  # 1-methylimidazole-4-carbaldehyde nitro
+        "O=[N+]([O-])c1ccccc1CC",  # nitrobenzene + ethyl: aryl-C cut leaves nitrophenyl sub-frag
+        "COc1ccc([N+](=O)[O-])cc1CCC",  # methoxy-nitrophenyl + propyl chain
+        "COc1nc(OC)c([N+](=O)[O-])cc1[N+](=O)[O-]",  # two nitro groups
         # Sanity: molecule without nitro must also satisfy the invariant
         "c1ccccc1CC(=O)O",
         "CCO",
@@ -425,3 +443,159 @@ def test_all_nodes_have_valid_delta_h0_formula(smiles: str) -> None:
         "Likely cause: compute_cc_h_floor overcounted the H floor for sub-fragments "
         "containing [N+](=O)[O-], making delta_h=0 invalid (floor > num_hs_prior)."
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. Regression: bond-free (single-atom) molecules
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("smiles", ["C", "F", "N", "O", "Br", "[SiH4]"])
+def test_extract_mol_info_bond_free_molecule_shapes(smiles: str) -> None:
+    """Single-atom molecules must keep the (num_bonds, 2) bond contract.
+
+    ``np.array([], dtype=np.int32)`` is 1-D, which raised
+    ``ValueError: Buffer has wrong number of dimensions (expected 2, got 1)``
+    in the typed Cython buffer of ``compute_frags.update_bonds``.  Every atom
+    must also appear in ``atoms_to_bonds`` so that isolated atoms map to an
+    empty bond list instead of raising ``KeyError``.
+    """
+    mol_d = extract_mol_info(smiles)
+
+    assert mol_d["bonds"].shape == (0, 2)
+    assert mol_d["bonds"].dtype == np.int32
+    assert mol_d["atoms_to_bonds"] == {0: []}
+    assert mol_d["bond_mask_arr"].shape == (0,)
+
+
+@pytest.mark.parametrize(
+    ("smiles", "formula", "mz"),
+    [
+        ("C", "CH4", 16.0313),
+        ("O", "H2O", 18.0106),
+    ],
+)
+def test_compute_dags_bond_free_molecule(smiles: str, formula: str, mz: float) -> None:
+    """A bond-free molecule yields a single-node, edge-free DAG for the precursor."""
+    dag_d = _run_compute_dags(smiles)
+
+    assert dag_d["dag_num_nodes"] == 1
+    assert dag_d["dag_num_edges"] == 0
+    assert dag_d["dag"].x.shape[0] == 1
+    assert dag_d["dag"].edge_index.shape == (2, 0)
+    assert formula in dag_d["idx_to_formula"].values()
+    assert dag_d["formula_peak_mzs"][1, 0].item() == pytest.approx(mz, abs=1e-3)
+
+
+def test_extract_mol_info_bonded_molecule_covers_every_atom() -> None:
+    """Bonded molecules keep their bond lists, with one entry per atom."""
+    mol_d = extract_mol_info("CCO")
+
+    assert mol_d["bonds"].shape == (2, 2)
+    assert mol_d["atoms_to_bonds"] == {0: [0], 1: [0, 1], 2: [1]}
+
+
+# ---------------------------------------------------------------------------
+# 13. Isotope-labeled atoms are rejected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("smiles", "label"),
+    [
+        ("[14CH4]", "[14C]"),
+        ("[13CH3]O", "[13C]"),
+        ("[15NH2]CC(=O)O", "[15N]"),
+        ("[37Cl]c1ccccc1", "[37Cl]"),
+        ("[2H]C1=C([2H])c2ccccc12", "[2H]"),
+    ],
+)
+def test_extract_mol_info_rejects_isotope_labels(smiles: str, label: str) -> None:
+    """Isotope-labeled molecules must raise instead of yielding unlabeled masses.
+
+    Formulae and masses are monoisotopic per element, so a label such as 13C is
+    silently dropped: '[13CH3]O' previously produced exactly the same formulae
+    and m/z as 'CO', putting every predicted peak ~1 Da off.
+    """
+    with pytest.raises(ValueError, match="isotope-labeled atoms currently not supported"):
+        extract_mol_info(smiles)
+
+    with pytest.raises(ValueError, match=re.escape(label)):
+        extract_mol_info(smiles)
+
+
+@pytest.mark.parametrize("smiles", ["CO", "NCC(=O)O", "c1ccccc1O", "C"])
+def test_extract_mol_info_accepts_unlabeled_molecules(smiles: str) -> None:
+    """Molecules at natural isotopic abundance are unaffected by the isotope gate."""
+    mol_d = extract_mol_info(smiles)
+
+    assert len(mol_d["elems"]) == mol_d["mol"].GetNumAtoms()
+
+
+# ---------------------------------------------------------------------------
+# 14. formula_peak_mzs column 0 must be the MONOISOTOPIC mass
+# ---------------------------------------------------------------------------
+
+
+def _monoisotopic_mass(formula: str) -> float:
+    """Sum of most-common-isotope masses, i.e. what column 0 is supposed to hold."""
+    return sum(
+        count * PERIODIC_TABLE.GetMostCommonIsotopeMass(element)
+        for element, count in parse_formula(formula).items()
+    )
+
+
+def _formula_col0_deltas(smiles: str, isotopes: bool) -> dict[str, float]:
+    """Map each non-empty formula to ``formula_peak_mzs[idx, 0] - monoisotopic mass``."""
+    dag_d = compute_dags(
+        extract_mol_info(smiles),
+        max_depth=1,
+        h_prior=True,
+        max_h_transfer=2,
+        frag_max_time=int(1e6),
+        isotopes=isotopes,
+        nb_isomorphic=False,
+        wl_max_iterations=-1,
+    )
+    peak_mzs = np.asarray(dag_d["formula_peak_mzs"])
+    return {
+        formula: float(peak_mzs[idx, 0]) - _monoisotopic_mass(formula)
+        for idx, formula in dag_d["idx_to_formula"].items()
+        if formula != ""
+    }
+
+
+# 1,2,4,5-tetrachlorobenzene: every Cl4 fragment has M+2 as its base isotopologue.
+_TETRACHLOROBENZENE = "Clc1cc(Cl)c(Cl)c(Cl)c1"
+
+
+def test_formula_peak_mzs_col0_is_monoisotopic_without_isotopes() -> None:
+    """With ``isotopes=False`` column 0 is the monoisotopic mass for every formula.
+
+    ``frag_params.num_isotopes`` is 1 in config/template.yml and no config overrides
+    it, so ``SpecMolFragDataset`` only ever reads ``formula_peak_mzs[:, :1]``.  That
+    column is the m/z the model is trained and served on, so it must be monoisotopic.
+    """
+    deltas = _formula_col0_deltas(_TETRACHLOROBENZENE, isotopes=False)
+
+    assert any("Cl4" in formula for formula in deltas), deltas
+    assert max(abs(delta) for delta in deltas.values()) < 1e-3, deltas
+
+
+def test_formula_peak_mzs_col0_is_wrong_with_isotopes() -> None:
+    """``isotopes=True`` puts the MOST ABUNDANT isotopologue in column 0, not M+0.
+
+    This pins the reason ``--isotopes`` defaults to False in
+    ``preproc_scripts/03_prepare_dag_feats.py``.  ``compute_dags`` sorts the isotope
+    peaks by abundance before truncating them to ``MAX_NUM_MZS_PER_FORMULA``, so with
+    ``num_isotopes=1`` a Cl4 fragment is served M+2 — 2.0067 Da off, far outside the
+    10 ppm instrument tolerance.  Training DAGs are built with ``ISO_FLAG=False``
+    (``scripts/manual_slurm/fir/frag_gen_common.sh``), so turning this on for
+    inference preprocessing alone is a train/serve skew.
+    """
+    deltas = _formula_col0_deltas(_TETRACHLOROBENZENE, isotopes=True)
+
+    cl4_deltas = [delta for formula, delta in deltas.items() if "Cl4" in formula]
+    assert cl4_deltas, deltas
+    # Two 35Cl -> 37Cl substitutions, at the coarse 1.00335 Da isotope spacing.
+    assert all(abs(delta - 2.0067) < 1e-3 for delta in cl4_deltas), deltas

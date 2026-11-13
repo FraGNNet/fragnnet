@@ -11,18 +11,20 @@ import torch.nn.functional as F
 import torch_geometric as pyg
 
 from fragnnet.model.base_model import (
+    AdductScaler,
     CEModel,
     CEScaler,
     FragModeModel,
     FragModeScaler,
     InstModel,
     PrecModel,
+    StratumScaler,
 )
 from fragnnet.model.form_embedder import get_embedder
 from fragnnet.model.nn_blocks import GNN, MLPBlocks, build_pool_module
 from fragnnet.utils.data_utils import combine_formulae
 from fragnnet.utils.feat_utils import get_mol_feats_sizes
-from fragnnet.utils.formula_utils import PREC_TYPE_TO_FORMULA_DIFF
+from fragnnet.utils.formula_utils import formula_row_prec_deltas
 from fragnnet.utils.frag_utils import (
     compute_boundary_mask,
     get_edge_feats,
@@ -41,6 +43,42 @@ from fragnnet.utils.misc_utils import (
 from fragnnet.utils.spec_utils import batched_bin_func
 
 logger = logging.getLogger(__name__)
+
+# Outputs of `FraGNNetModel.forward` that only exist when the terminal explainability
+# marginals are computed; every one of them is None on a forward that skipped them.
+# A forward with `return_explainability_tensors=False` returns None for every one of them.
+EXPLAINABILITY_OUTPUT_KEYS = frozenset(
+    {
+        "pred_formula_logprobs",
+        "pred_node_logprobs",
+        "pred_node_formula_logprobs",
+        "pred_formula_node_logprobs",
+        "pred_joint_logprobs",
+        "pred_joint_node_idxs",
+        "pred_joint_formula_idxs",
+        "pred_joint_batch_idxs",
+        "pred_h_counts",
+        "pred_h_batch_idxs",
+        "pred_h_logprobs",
+        "pred_formula_formula_idxs",
+        "pred_node_node_idxs",
+        "pred_joint_h_counts",
+        "pred_joint_h_idxs",
+        # nb_iso (isomorphic-neighbourhood) marginals ride the same gate
+        "pred_nb_node_logprobs",
+        "pred_nb_node_formula_logprobs",
+        "pred_nb_formula_node_logprobs",
+        "pred_nb_node_node_logprobs",
+        "pred_nb_node_node_idxs",
+        "pred_nb_node_batch_idxs",
+        "pred_nb_joint_logprobs",
+        "pred_nb_joint_node_idxs",
+        "pred_nb_joint_formula_idxs",
+        "pred_nb_joint_batch_idxs",
+        "pred_nb_node_node_node_idxs",
+        "pred_nb_node_node_batch_idxs",
+    }
+)
 
 
 class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
@@ -105,6 +143,9 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
         frag_mode_scale: bool,
         ce_scale: bool,
         ce_scaler_hidden_dim: int,
+        adduct_scale: bool,
+        stratum_scale: bool,
+        stratum_scaler_embed_dim: int,
         output_formula_str: bool,
         use_nce: bool,
         use_ace: bool,
@@ -197,11 +238,16 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             formula_d = {"max_count_int": 255}
             depth_d = {"max_count_int": num_depth + 1}
             complement_d = {"max_count_int": 2}
+            dag_degree_d = {"max_count_int": 64}
+            num_heavy_atoms_d = {"max_count_int": 128}
         else:
-            formula_d = depth_d = complement_d = {}
+            formula_d = depth_d = complement_d = dag_degree_d = num_heavy_atoms_d = {}
         self.formula_embedder = get_embedder(int_embedder, **formula_d)
         self.depth_embedder = get_embedder(int_embedder, **depth_d)
         self.complement_embedder = get_embedder(int_embedder, **complement_d)
+        self.out_degree_embedder = get_embedder(int_embedder, **dag_degree_d)
+        self.in_degree_embedder = get_embedder(int_embedder, **dag_degree_d)
+        self.num_heavy_atoms_embedder = get_embedder(int_embedder, **num_heavy_atoms_d)
         self.frag_node_feats = frag_node_feats
         self.frag_edge_feats = frag_edge_feats
         self._compute_frag_feats_sizes()
@@ -334,10 +380,33 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
         else:
             self.ce_scaler = None
 
+        # adduct-type FiLM output scaling (applied after ce_scaler)
+        self.adduct_scale = adduct_scale
+        if self.adduct_scale:
+            self.adduct_scaler = AdductScaler(
+                num_adduct_types=len(prec_types),
+                output_dim=self.mlp_output_dim,
+            )
+        else:
+            self.adduct_scaler = None
+
+        # combined stratum FiLM output scaling (applied after adduct_scaler)
+        self.stratum_scale = stratum_scale
+        if self.stratum_scale:
+            self.stratum_scaler = StratumScaler(
+                num_inst_types=len(inst_types),
+                num_frag_modes=len(frag_modes),
+                num_adduct_types=len(prec_types),
+                embed_dim=stratum_scaler_embed_dim,
+                output_dim=self.mlp_output_dim,
+            )
+        else:
+            self.stratum_scaler = None
+
         # use extra mlp for node formula
         if self.mlp_output_format in ["node_formula"]:
             node_mlp_kwargs = {
-                "input_size": 2 * self.frag_embedder.hidden_size,
+                "input_size": mlp_input_dim,
                 "output_size": 1,
                 "hidden_size": mlp_hidden_size,
                 "num_layers": mlp_num_layers,
@@ -452,6 +521,12 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             self.frag_node_feats_size += self.num_elements * self.formula_embedder.num_dim
         if "depth" in self.frag_node_feats:
             self.frag_node_feats_size += self.num_depth * self.depth_embedder.num_dim
+        if "out_degree" in self.frag_node_feats:
+            self.frag_node_feats_size += self.out_degree_embedder.num_dim
+        if "in_degree" in self.frag_node_feats:
+            self.frag_node_feats_size += self.in_degree_embedder.num_dim
+        if "num_heavy_atoms" in self.frag_node_feats:
+            self.frag_node_feats_size += self.num_heavy_atoms_embedder.num_dim
         # edges
         self.frag_edge_feats_size = 0
         if "cc" in self.frag_edge_feats:
@@ -473,6 +548,9 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
         self.formula_embedder = th.compile(self.formula_embedder, **kwargs)
         self.depth_embedder = th.compile(self.depth_embedder, **kwargs)
         self.complement_embedder = th.compile(self.complement_embedder, **kwargs)
+        self.out_degree_embedder = th.compile(self.out_degree_embedder, **kwargs)
+        self.in_degree_embedder = th.compile(self.in_degree_embedder, **kwargs)
+        self.num_heavy_atoms_embedder = th.compile(self.num_heavy_atoms_embedder, **kwargs)
         if hasattr(self, "ce_embedder"):
             self.ce_embedder = th.compile(self.ce_embedder, **kwargs)
         if hasattr(self, "m_ce_embedder"):
@@ -502,7 +580,7 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
         spec_inst_type: th.Tensor | None = None,
         spec_frag_mode: th.Tensor | None = None,
         spec_prec_type_str: np.ndarray | None = None,
-        return_explainability_tensors: bool = False,
+        return_explainability_tensors: bool = True,
         **kwargs,
     ):
         """forward methods for joint predictor
@@ -518,6 +596,11 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             frag_formula_sizes (th.Tensor): _description_
             frag_formula_cumsizes (th.Tensor): _description_
             frag_formula_peak_sizes (th.Tensor): _description_
+            return_explainability_tensors (bool): Whether this caller will read the terminal
+                explainability marginals and their index arrays - everything in
+                `EXPLAINABILITY_OUTPUT_KEYS`. False drops them (they come back None) and
+                skips ~6 scatter passes over the joint grid. Default True, so a caller that
+                says nothing still gets them.
 
         Returns:
             _type_: _description_
@@ -868,6 +951,31 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
                 )
             )
             frag_ndata.append(frag_depth)
+        # DAG structural scalars: out_degree, in_degree, num_heavy_atoms
+        if "out_degree" in self.frag_node_feats:
+            frag_ndata.append(
+                self.out_degree_embedder(
+                    get_node_feats(frag_x, frag_node_feat_idxs, "out_degree").reshape(
+                        batch_frag_num_nodes, -1
+                    )
+                )
+            )
+        if "in_degree" in self.frag_node_feats:
+            frag_ndata.append(
+                self.in_degree_embedder(
+                    get_node_feats(frag_x, frag_node_feat_idxs, "in_degree").reshape(
+                        batch_frag_num_nodes, -1
+                    )
+                )
+            )
+        if "num_heavy_atoms" in self.frag_node_feats:
+            frag_ndata.append(
+                self.num_heavy_atoms_embedder(
+                    get_node_feats(frag_x, frag_node_feat_idxs, "num_heavy_atoms").reshape(
+                        batch_frag_num_nodes, -1
+                    )
+                )
+            )
         # edge complement
         if "complement" in self.frag_edge_feats:
             frag_edge_complement = self.complement_embedder(
@@ -1134,8 +1242,39 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
                     nce_stats=kwargs.get("spec_nce_stats"),
                     ace_stats=kwargs.get("spec_ace_stats"),
                 )
-            # if include_cmf:
-            #   frag_joint_logits[:, 2 * self.num_hs + 1:] = LOG_ZERO(frag_joint_logits.dtype)
+            # apply adduct-type FiLM scaling if enabled
+            if self.adduct_scaler is not None:
+                assert spec_prec_type is not None, "spec_prec_type required for adduct_scaler"
+                frag_joint_logits = self.adduct_scaler(
+                    frag_joint_logits, spec_prec_type, frag_node_batch_idxs
+                )
+            # apply combined stratum FiLM scaling if enabled
+            if self.stratum_scaler is not None:
+                assert spec_inst_type is not None, "spec_inst_type required for stratum_scaler"
+                assert spec_frag_mode is not None, "spec_frag_mode required for stratum_scaler"
+                assert spec_prec_type is not None, "spec_prec_type required for stratum_scaler"
+                frag_joint_logits = self.stratum_scaler(
+                    frag_joint_logits,
+                    spec_inst_type,
+                    spec_frag_mode,
+                    spec_prec_type,
+                    frag_node_batch_idxs,
+                )
+            if include_cmf:
+                # CMF channels that map to NULL should not consume probability mass before
+                # softmax.  This covers every CMF column, including Δh=0: adducts whose CMF
+                # ion duplicates a CRF hydrogen shift emit no CMF rows at all, and any adduct
+                # can leave a column NULL when that shift was not generated for the node.
+                crf_width = 2 * self.num_hs + 1
+                formula_idxs_2d = frag_joint_formula_idxs.reshape(
+                    batch_frag_num_nodes, self.mlp_output_dim
+                )
+                cmf_null = formula_idxs_2d[:, crf_width:] == frag_node_offsets.unsqueeze(1)
+                if cmf_null.any():
+                    null_mask = F.pad(cmf_null, (crf_width, 0))
+                    frag_joint_logits = frag_joint_logits.masked_fill(
+                        null_mask, LOG_ZERO(frag_joint_logits.dtype)
+                    )
             assert frag_joint_logits.shape[1] == self.mlp_output_dim, (
                 frag_joint_logits.shape[1],
                 2 * self.num_hs + 1,
@@ -1183,6 +1322,31 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
                 frag_node_formula_logits = self.frag_mode_scaler(
                     frag_node_formula_logits, spec_frag_mode, frag_node_batch_idxs
                 )
+            if self.ce_scaler is not None:
+                frag_node_formula_logits = self.ce_scaler(
+                    frag_node_formula_logits,
+                    frag_node_batch_idxs,
+                    nce_stats=kwargs.get("spec_nce_stats"),
+                    ace_stats=kwargs.get("spec_ace_stats"),
+                )
+            # apply adduct-type FiLM scaling if enabled
+            if self.adduct_scaler is not None:
+                assert spec_prec_type is not None, "spec_prec_type required for adduct_scaler"
+                frag_node_formula_logits = self.adduct_scaler(
+                    frag_node_formula_logits, spec_prec_type, frag_node_batch_idxs
+                )
+            # apply combined stratum FiLM scaling if enabled
+            if self.stratum_scaler is not None:
+                assert spec_inst_type is not None, "spec_inst_type required for stratum_scaler"
+                assert spec_frag_mode is not None, "spec_frag_mode required for stratum_scaler"
+                assert spec_prec_type is not None, "spec_prec_type required for stratum_scaler"
+                frag_node_formula_logits = self.stratum_scaler(
+                    frag_node_formula_logits,
+                    spec_inst_type,
+                    spec_frag_mode,
+                    spec_prec_type,
+                    frag_node_batch_idxs,
+                )
             assert frag_node_formula_logits.shape[1] == self.mlp_output_dim, (
                 frag_node_formula_logits.shape[1],
                 self.mlp_output_dim,
@@ -1193,15 +1357,12 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             frag_node_logits = self.node_module(frag_embed).squeeze(1)
             frag_node_logprobs = scatter_logsoftmax(frag_node_logits, frag_node_batch_idxs)
 
-            # joint logits = formula_logits + node_logits (broadcast); exposed for post-branch
-            # scatter_logsoftmax over real positions (mirrors formula path's frag_joint_logits)
-            frag_joint_logits = (
-                frag_node_formula_logits + frag_node_logits.unsqueeze(-1)
-            ).flatten()
-
             # log p(f,n) = log p(f|n) + log p(n)
             frag_joint_logprobs = frag_node_formula_logprobs + frag_node_logprobs.unsqueeze(-1)
             frag_joint_logprobs = frag_joint_logprobs.flatten()
+            # Explainability conditions this same joint distribution on real states.
+            # Raw conditional logits would introduce a different normalizer per node.
+            frag_joint_logits = frag_joint_logprobs
 
             # compute total NULL probability (before renormalization)
             frag_null_formula_logprob = scatter_logsumexp(
@@ -1298,10 +1459,10 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             # print(scatter_logsumexp(frag_edge_logprobs,frag_edge_batch_idxs))
             frag_node_h_counts = get_node_feats(frag_x, frag_node_feat_idxs, "h_counts")
             frag_edge_h_ranges = get_edge_feats(frag_edge_attr, frag_edge_feat_idxs, "h_range")
-            # Memory Opt #2: Use einsum to compute h_diffs without Cartesian product expansion
-            src_h_counts = frag_node_h_counts[frag_edge_index[0]]  # (num_edges,)
-            dst_h_counts = frag_node_h_counts[frag_edge_index[1]]  # (num_edges,)
-            frag_edge_h_diffs = src_h_counts.unsqueeze(1) - dst_h_counts.unsqueeze(1)
+            # Enumerate every source/destination H-channel pair in row-major order.
+            src_h_counts = frag_node_h_counts[frag_edge_index[0]]  # (E, H)
+            dst_h_counts = frag_node_h_counts[frag_edge_index[1]]  # (E, H)
+            frag_edge_h_diffs = src_h_counts.unsqueeze(2) - dst_h_counts.unsqueeze(1)
             frag_edge_h_diffs = frag_edge_h_diffs.reshape(frag_edge_h_diffs.shape[0], -1)
             frag_edge_h_range_masks = th.logical_or(
                 frag_edge_h_diffs < frag_edge_h_ranges[:, 0].unsqueeze(-1),
@@ -1313,10 +1474,16 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             dst_formula_logprobs = frag_node_formula_logprobs[
                 frag_edge_index[1]
             ]  # (num_edges, mlp_output_dim)
-            # Outer product of per-node formula log-probs across each edge: (E, H*H)
-            frag_edge_h_logprobs = th.einsum(
-                "ni,nj->nij", src_formula_logprobs, dst_formula_logprobs
-            ).reshape(len(src_formula_logprobs), -1)
+            # When CMF is active, only CRF columns represent bond-cleavage H-transfers;
+            # CMF columns encode charge-migration which has no edge-H-diff semantics.
+            if include_cmf:
+                _crf_w = 2 * self.num_hs + 1
+                src_formula_logprobs = src_formula_logprobs[:, :_crf_w]
+                dst_formula_logprobs = dst_formula_logprobs[:, :_crf_w]
+            # log P(h_src, h_dst) = log P(h_src) + log P(h_dst), shape (E, H*H).
+            frag_edge_h_logprobs = (
+                src_formula_logprobs.unsqueeze(2) + dst_formula_logprobs.unsqueeze(1)
+            ).flatten(start_dim=1)
 
         else:
             frag_edge_logprobs = None
@@ -1325,73 +1492,88 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             frag_edge_h_logprobs = None
             frag_edge_batch_idxs = None
 
-        # select (will remove all NULL formula idxs, potentially some node idxs too if they contain only NULLs)
-        _real_mask = frag_joint_mask.bool()
-        # Compute real positions once; derive node/h-slot indices via integer div/mod to avoid
-        # materializing three separate (N×H) long tensors (node_idxs, h_counts, h_offsets).
-        real_pos = th.nonzero(_real_mask, as_tuple=False).squeeze(1)  # (J,)
-        H = self.mlp_output_dim
-        frag_real_joint_logits = frag_joint_logits[_real_mask]
-        frag_real_joint_node_idxs = real_pos // H
-        _real_h_pos = real_pos % H
-        frag_real_joint_h_counts = self._h_counts_buf[_real_h_pos]
-        frag_real_joint_h_offsets = th.zeros_like(frag_real_joint_h_counts)
-        frag_real_joint_formula_idxs = frag_joint_formula_idxs[_real_mask]
-        frag_real_joint_batch_idxs = frag_node_batch_idxs[frag_real_joint_node_idxs]
-        # P(f,n)
-        frag_real_joint_logprobs = scatter_logsoftmax(
-            frag_real_joint_logits, frag_real_joint_batch_idxs
-        )
-        # P(n) - sum, renormalize, but keep all-NULL nodes (as zeros)
-        _need_expl_idxs = return_explainability_tensors or self.debug_validate_outputs
-        frag_real_node_node_idxs = (
-            th.arange(batch_frag_num_nodes, device=device) if _need_expl_idxs else None
-        )
-        frag_real_node_logprobs = scatter_logsumexp(
-            frag_real_joint_logprobs,
-            frag_real_joint_node_idxs,
-            dim_size=batch_frag_num_nodes,
-        )
-        frag_real_node_logprobs = scatter_logsoftmax(frag_real_node_logprobs, frag_node_batch_idxs)
-        # P(f) - sum, renormalize, but keep NULL formulae (as zeros)
-        frag_real_formula_logprobs = scatter_logsumexp(
-            frag_real_joint_logprobs,
-            frag_real_joint_formula_idxs,
-            dim_size=batch_frag_num_formulae,
-        )
-        frag_real_formula_logprobs = scatter_logsoftmax(
-            frag_real_formula_logprobs,
-            frag_formula_batch_idxs,
-        )
-        frag_real_formula_formula_idxs = (
-            th.arange(batch_frag_num_formulae, device=device) if _need_expl_idxs else None
-        )
-        # P(f|n) - remove all NULLs from conditionals
-        frag_real_node_formula_logprobs = (
-            frag_real_joint_logprobs - frag_real_node_logprobs[frag_real_joint_node_idxs]
-        )
-        frag_real_node_formula_logprobs = scatter_logsoftmax(
-            frag_real_node_formula_logprobs, frag_real_joint_node_idxs
-        )
-        # P(n|f) - remove all NULLs from conditionals
-        frag_real_formula_node_logprobs = (
-            frag_real_joint_logprobs - frag_real_formula_logprobs[frag_real_joint_formula_idxs]
-        )
-        frag_real_formula_node_logprobs = scatter_logsoftmax(
-            frag_real_formula_node_logprobs, frag_real_joint_formula_idxs
-        )
-        # hydrogens
-        frag_real_joint_h_idxs = (
-            frag_real_joint_h_counts + self.num_hs + frag_real_joint_h_offsets
-        ) + frag_real_joint_batch_idxs * self.mlp_output_dim
+        # Explainability marginals (P(n), P(f), P(f|n), P(n|f), P(h) + nb_iso below) are terminal:
+        # nothing on the loss-critical spectrum path (spec_logprobs, null, oos) depends on them.
+        # They cost ~6 scatter passes over the joint grid (J = N*H), the largest array in the
+        # forward, so a caller that will not read them should not pay for them.
+        #
+        # ONE per-call switch decides: `return_explainability_tensors`. It defaults to True, so
+        # a caller that says nothing (the loss path) behaves as it always has, and the inference
+        # exporters pass their own computed demand. `self.training` is deliberately NOT part of
+        # the decision - val/test loss forwards also run with it False and do consume the
+        _compute_expl = self.debug_validate_outputs or return_explainability_tensors
+        if _compute_expl:
+            # select (will remove all NULL formula idxs, potentially some node idxs too if they contain only NULLs)
+            _real_mask = frag_joint_mask.bool()
+            # Compute real positions once; derive node/h-slot indices via integer div/mod to avoid
+            # materializing three separate (N×H) long tensors (node_idxs, h_counts, h_offsets).
+            real_pos = th.nonzero(_real_mask, as_tuple=False).squeeze(1)  # (J,)
+            H = self.mlp_output_dim
+            frag_real_joint_logits = frag_joint_logits[_real_mask]
+            frag_real_joint_node_idxs = real_pos // H
+            _real_h_pos = real_pos % H
+            frag_real_joint_h_counts = self._h_counts_buf[_real_h_pos]
+            frag_real_joint_h_offsets = th.zeros_like(frag_real_joint_h_counts)
+            frag_real_joint_formula_idxs = frag_joint_formula_idxs[_real_mask]
+            frag_real_joint_batch_idxs = frag_node_batch_idxs[frag_real_joint_node_idxs]
+            # P(f,n)
+            frag_real_joint_logprobs = scatter_logsoftmax(
+                frag_real_joint_logits, frag_real_joint_batch_idxs
+            )
+            # P(n) - sum, renormalize, but keep all-NULL nodes (as zeros)
+            frag_real_node_node_idxs = th.arange(batch_frag_num_nodes, device=device)
+            frag_real_node_logprobs = scatter_logsumexp(
+                frag_real_joint_logprobs,
+                frag_real_joint_node_idxs,
+                dim_size=batch_frag_num_nodes,
+            )
+            frag_real_node_logprobs = scatter_logsoftmax(
+                frag_real_node_logprobs, frag_node_batch_idxs
+            )
+            # P(f) - sum, renormalize, but keep NULL formulae (as zeros)
+            frag_real_formula_logprobs = scatter_logsumexp(
+                frag_real_joint_logprobs,
+                frag_real_joint_formula_idxs,
+                dim_size=batch_frag_num_formulae,
+            )
+            frag_real_formula_logprobs = scatter_logsoftmax(
+                frag_real_formula_logprobs,
+                frag_formula_batch_idxs,
+            )
+            frag_real_formula_formula_idxs = th.arange(batch_frag_num_formulae, device=device)
+            # P(f|n) - remove all NULLs from conditionals
+            frag_real_node_formula_logprobs = (
+                frag_real_joint_logprobs - frag_real_node_logprobs[frag_real_joint_node_idxs]
+            )
+            frag_real_node_formula_logprobs = scatter_logsoftmax(
+                frag_real_node_formula_logprobs, frag_real_joint_node_idxs
+            )
+            # P(n|f) - remove all NULLs from conditionals
+            frag_real_formula_node_logprobs = (
+                frag_real_joint_logprobs - frag_real_formula_logprobs[frag_real_joint_formula_idxs]
+            )
+            frag_real_formula_node_logprobs = scatter_logsoftmax(
+                frag_real_formula_node_logprobs, frag_real_joint_formula_idxs
+            )
+            # hydrogens
+            frag_real_joint_h_idxs = (
+                frag_real_joint_h_counts + self.num_hs + frag_real_joint_h_offsets
+            ) + frag_real_joint_batch_idxs * self.mlp_output_dim
 
-        frag_real_h_logprobs = scatter_logsumexp(
-            frag_real_joint_logprobs,
-            frag_real_joint_h_idxs,
-            dim_size=batch_size * self.mlp_output_dim,
-        )
+            frag_real_h_logprobs = scatter_logsumexp(
+                frag_real_joint_logprobs,
+                frag_real_joint_h_idxs,
+                dim_size=batch_size * self.mlp_output_dim,
+            )
+            frag_real_h_logprobs = th.clamp(frag_real_h_logprobs, max=0.0)
+        else:
+            # Skipped marginals are returned as None.
+            frag_real_joint_logprobs = frag_real_joint_node_idxs = None
+            frag_real_joint_formula_idxs = frag_real_joint_batch_idxs = None
+            frag_real_node_logprobs = frag_real_formula_logprobs = None
+            frag_real_node_formula_logprobs = frag_real_formula_node_logprobs = None
+            frag_real_h_logprobs = None
 
-        frag_real_h_logprobs = th.clamp(frag_real_h_logprobs, max=0.0)
         frag_real_h_counts = self._h_counts_range_buf.repeat(batch_size)
         frag_real_h_batch_idxs = th.repeat_interleave(
             th.arange(batch_size, device=device), self.mlp_output_dim
@@ -1554,7 +1736,7 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
             "pred_nb_node_node_node_idxs": frag_nb_node_node_node_idxs,  # (Isomorphism) Node indices for node-node mapping [N]
             "pred_nb_node_node_batch_idxs": frag_nb_node_node_batch_idxs,  # (Isomorphism) Batch indices for node-node mapping [N]
         }
-        if return_explainability_tensors:
+        if _compute_expl:
             out_d["pred_formula_formula_idxs"] = frag_real_formula_formula_idxs  # [F]
             out_d["pred_node_node_idxs"] = frag_real_node_node_idxs  # [N]
             out_d["pred_joint_h_counts"] = frag_real_joint_h_counts  # [J]
@@ -1568,11 +1750,12 @@ class FraGNNetModel(nn.Module, CEModel, PrecModel, InstModel, FragModeModel):
                 "spec_prec_type_strs must be provided if output_formula_str=True"
             )
             assert frag_formula_str.shape[0] == frag_real_formula_logprobs.shape[0]
-            prec_type_str = spec_prec_type_str
-            prec_type_delta_comp = np.array(
-                [PREC_TYPE_TO_FORMULA_DIFF[prec_type_str[i]] for i in range(len(prec_type_str))]
+            prec_type_delta_comp = formula_row_prec_deltas(
+                spec_prec_type_str,
+                frag_formula_cumsizes.cpu().tolist(),
+                include_cmf=include_cmf,
+                max_h_transfer=self.num_hs,
             )
-            prec_type_delta_comp = prec_type_delta_comp[frag_formula_batch_idxs.cpu().numpy()]
             pred_formula_str = [
                 combine_formulae(frag_formula_str[i], prec_type_delta_comp[i])
                 if frag_formula_str[i] != ""

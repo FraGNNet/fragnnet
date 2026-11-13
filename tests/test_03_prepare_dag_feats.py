@@ -335,3 +335,37 @@ def test_argparse_wandb_validation():
     # just verify the args can be parsed
     assert hasattr(args, "wandb_mode")
     assert hasattr(args, "wandb_run_name")
+
+
+def test_isotopes_cli_default_is_false():
+    """``--isotopes`` must default to False.
+
+    The parser lives under ``if __name__ == "__main__"``, so it is read from the AST
+    rather than imported.  A True default silently isotope-expands every DAG built by
+    the inference preprocessing scripts (none of them pass the flag), and because
+    ``compute_dags`` sorts the peaks by abundance before truncating to
+    ``frag_params.num_isotopes`` (1 everywhere), column 0 then holds the most abundant
+    isotopologue instead of the monoisotopic mass -- M+2 for a fragment with >=3 Cl.
+    Training DAGs are built with ``ISO_FLAG=False``, so True here is a train/serve skew.
+    See ``tests/test_frag_utils_compute_dags.py`` for the measurement.
+    """
+    import ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script_path = repo_root / "preproc_scripts" / "03_prepare_dag_feats.py"
+    tree = ast.parse(script_path.read_text())
+
+    defaults = [
+        keyword.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "--isotopes"
+        for keyword in node.keywords
+        if keyword.arg == "default"
+    ]
+
+    assert len(defaults) == 1, f"expected exactly one --isotopes argument, found {len(defaults)}"
+    assert ast.literal_eval(defaults[0]) is False

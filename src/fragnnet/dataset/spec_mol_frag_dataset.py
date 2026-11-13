@@ -1,14 +1,14 @@
 import json
 import logging
 import os
-import pickle
 import sys
+from collections import OrderedDict
 
-import lmdb
 import numpy as np
 import torch as th
 import torch.nn.functional as F
 import torch_geometric as pyg
+from rdkit.Chem import AllChem
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
@@ -17,6 +17,9 @@ from fragnnet.utils.feat_utils import batch_mols_frags, get_frag_graph
 from fragnnet.utils.formula_utils import (
     PREC_TYPE_TO_CMF_MASS_DIFF,
     PREC_TYPE_TO_MASS_DIFF,
+    cmf_duplicate_crf_h_shift,
+    prec_type_removed_counts,
+    tracked_element_counts,
 )
 from fragnnet.utils.frag_utils import (
     NODE_FEAT_TO_IDX,
@@ -26,6 +29,10 @@ from fragnnet.utils.frag_utils import (
     load_frag_d,
 )
 from fragnnet.utils.misc_utils import get_pyg_memory_usage
+
+# Per-formula element counts, attached by _process_neutral_frag and consumed (and removed) by
+# _apply_fragment_mz_change so that it never reaches the collate or the model.
+FORMULA_ELEMENT_COUNTS_KEY = "_frag_formula_element_counts"
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +99,14 @@ class SpecMolFragDataset(SpecMolDataset):
         )
         self.mol_params = mol_params
         self.frag_dp = frag_dp
-        self.frag_env = None
         self.frag_h5 = None  # h5py.File handle when using HDF5 backend
         self.frag_params = frag_params
+        # Neutral-DAG LRU, see _get_neutral_frag. Built lazily so it is never pickled to
+        # dataloader workers; with fork each worker then fills its own.
+        self._frag_cache = None
+        self._frag_cache_size = int(frag_params["cache_size"])
         if frag_dp.endswith(".h5"):
             self.frag_backend = "h5"
-        elif os.path.isdir(frag_dp) and os.path.exists(os.path.join(frag_dp, "data.mdb")):
-            self.frag_backend = "lmdb"
         else:
             self.frag_backend = "folder"
 
@@ -186,8 +194,8 @@ class SpecMolFragDataset(SpecMolDataset):
     def _find_missing_frag_mol_ids(self) -> set[int]:
         """Return mol_ids that have no DAG file on disk (folder backend only).
 
-        For lmdb and h5 backends all mol_ids are stored in a single file, so
-        this check is not needed there.
+        For the h5 backend all mol_ids are stored in a single file, so this
+        check is not needed there.
 
         Returns:
             Set of integer mol_ids for which no DAG file can be found.
@@ -217,20 +225,14 @@ class SpecMolFragDataset(SpecMolDataset):
         """
 
         # preload frag dags
-        if self.frag_backend == "h5" and self.frag_h5 is None:
+        if (
+            self.frag_backend == "h5"
+            and self.frag_params["preload"]
+            and self.frag_h5 is None
+        ):
             import h5py
 
             self.frag_h5 = h5py.File(self.frag_dp, "r")
-        elif self.frag_backend == "lmdb" and self.frag_env is None:
-            self.frag_env = lmdb.open(
-                self.frag_dp,
-                readahead=False,
-                max_readers=2048,
-                readonly=True,
-                lock=False,
-                meminit=False,
-            )
-            self.txn = self.frag_env.begin()
         # folder backend: no setup needed
 
         if self.frag_params["preload"]:
@@ -243,14 +245,15 @@ class SpecMolFragDataset(SpecMolDataset):
                 disable=not self.enable_progress_bar,
             ):
                 if self.frag_backend == "h5":
-                    frag_entry = load_dag_hdf5(self.frag_h5[f"{int(mol_id)}"])
-                elif self.frag_backend == "lmdb":
-                    frag_entry = pickle.loads(bytes(self.txn.get(f"{int(mol_id)}".encode())))
+                    frag_entry = load_dag_hdf5(self.frag_h5, mol_id)
                 else:
                     frag_entry = load_frag_d(mol_id, self.frag_dp, self.frag_params["compressed"])
                 total_frag_entry_size += get_pyg_memory_usage(frag_entry["dag"])
                 self.frag_entries[mol_id] = frag_entry
             logger.info(f"> total_frag_entry_size: {total_frag_entry_size / 1e6:.2f} MB")
+            if self.frag_backend == "h5":
+                self.frag_h5.close()
+                self.frag_h5 = None
 
         # preprocess frag dags
         if self.frag_params["preprocess"]:
@@ -263,7 +266,7 @@ class SpecMolFragDataset(SpecMolDataset):
                 total=len(self.frag_entries),
                 disable=not self.enable_progress_bar,
             ):
-                frag_data = self._process_neutral_frag(self.frag_entries.pop(k))
+                frag_data = self._process_neutral_frag(self.frag_entries.pop(k), mol=self.mol_df.loc[k]["mol"])
                 total_frag_data_size += get_pyg_memory_usage(frag_data["frag_pyg"])
                 self.frag_data[k] = frag_data
             logger.info(f"> total_frag_data_size: {total_frag_data_size / 1e6:.2f} MB")
@@ -312,24 +315,18 @@ class SpecMolFragDataset(SpecMolDataset):
                 frag_data, spec_entry["prec_type"], neutral_peaks, clone_pyg=True
             )
 
-        elif self.frag_params["preload"]:
-            frag_entry = self.frag_entries[mol_id]
-            # frag_entry['frag_pyg'] = frag_entry['frag_pyg'].clone() # clone to avoid modifying the original one
-            frag_data = self._process_neutral_frag(frag_entry)
-            frag_data = self._apply_fragment_mz_change(
-                frag_data,
-                spec_entry["prec_type"],
-                frag_data["frag_formula_peak_mzs"],
-                clone_pyg=True,
-            )
         else:
-            frag_entry = self._load_frag_entry(mol_id)
-            frag_data = self._process_neutral_frag(frag_entry)
+            # `preload` (DAG bytes in RAM) and the bare path (read per access) differ only
+            # in where the entry comes from; both then have to build the PyG graph, so both
+            # go through the same cache.
+            frag_data, shared = self._get_neutral_frag(mol_id, mol_entry)
+            if shared:
+                frag_data = frag_data.copy()
             frag_data = self._apply_fragment_mz_change(
                 frag_data,
                 spec_entry["prec_type"],
                 frag_data["frag_formula_peak_mzs"],
-                clone_pyg=False,
+                clone_pyg=shared,
             )
 
         data = {**spec_data, **mol_data, **frag_data}
@@ -340,6 +337,54 @@ class SpecMolFragDataset(SpecMolDataset):
         if "formula" not in data:
             data["formula"] = mol_entry["formula"]
         return data
+
+    def _get_neutral_frag(self, mol_id: str, mol_entry) -> tuple[dict, bool]:
+        """Neutral (pre-adduct) fragment data for one molecule, served from a small LRU.
+
+        A DAG is per MOLECULE but ``__getitem__`` runs per SPECTRUM, and there are many
+        spectra per molecule (one per collision energy / adduct). Inference forces both
+        ``frag_params.preprocess`` and ``frag_params.preload`` off - see
+        ``apply_inference_config`` - so without this cache every spectrum of a molecule
+        re-read its DAG from HDF5/disk and rebuilt the PyG graph (plus Gasteiger charges
+        when ``frag_q`` is a node feature) from scratch.
+
+        Cache size is required via ``frag_params.cache_size`` (template: 16, 0 disables). Hit rate depends
+        on how clustered the same molecule's rows are in ``spec_df``: sorting the input by
+        ``mol_id`` maximizes it, and note that ``IterableSpecMolFragDataset`` shards indices
+        round-robin across workers, so each worker sees every Nth row.
+
+        Returns:
+            ``(frag_data, shared)``. When ``shared`` is True the dict is cached and aliased
+            by other samples, so the caller must ``.copy()`` it and pass ``clone_pyg=True``
+            to ``_apply_fragment_mz_change`` (which pops a key and writes into ``frag_pyg.x``
+            in place) - the same contract the ``preprocess`` branch already follows.
+        """
+        if self._frag_cache_size <= 0:
+            frag_entry = (
+                self.frag_entries[mol_id]
+                if self.frag_params["preload"]
+                else self._load_frag_entry(mol_id)
+            )
+            return self._process_neutral_frag(frag_entry, mol=mol_entry["mol"]), False
+
+        cache = self._frag_cache
+        if cache is None:
+            cache = self._frag_cache = OrderedDict()
+        frag_data = cache.get(mol_id)
+        if frag_data is not None:
+            cache.move_to_end(mol_id)
+            return frag_data, True
+
+        frag_entry = (
+            self.frag_entries[mol_id]
+            if self.frag_params["preload"]
+            else self._load_frag_entry(mol_id)
+        )
+        frag_data = self._process_neutral_frag(frag_entry, mol=mol_entry["mol"])
+        cache[mol_id] = frag_data
+        while len(cache) > self._frag_cache_size:
+            cache.popitem(last=False)
+        return frag_data, True
 
     def _load_frag_entry(self, mol_id: str) -> dict:
         """
@@ -356,25 +401,11 @@ class SpecMolFragDataset(SpecMolDataset):
                 import h5py
 
                 self.frag_h5 = h5py.File(self.frag_dp, "r")
-            return load_dag_hdf5(self.frag_h5[f"{int(mol_id)}"])
-        elif self.frag_backend == "lmdb":
-            if self.frag_env is None:
-                self.frag_env = lmdb.open(
-                    self.frag_dp,
-                    readahead=False,
-                    readonly=True,
-                    max_readers=2048,
-                    lock=False,
-                    meminit=False,
-                )
-                self.txn = self.frag_env.begin()
-            v = self.txn.get(f"{int(mol_id)}".encode())
-            assert v is not None, mol_id
-            return pickle.loads(bytes(v))
+            return load_dag_hdf5(self.frag_h5, mol_id)
         else:
             return load_frag_d(mol_id, self.frag_dp, self.frag_params["compressed"])
 
-    def _process_neutral_frag(self, frag_entry: dict) -> dict:
+    def _process_neutral_frag(self, frag_entry: dict, mol=None) -> dict:
         """
         Process the fragmentation dictionary to generate neutral fragment data.
 
@@ -382,6 +413,8 @@ class SpecMolFragDataset(SpecMolDataset):
         such as formula peak probabilities, formula strings, and m/z values.
         Args:
             frag_entry (dict): Fragmentation entry containing the DAG and related data.
+            mol: RDKit Mol object for the molecule. Required when "frag_q" is in
+                pyg_node_feats to compute per-fragment Gasteiger charge sums.
 
         Returns:
             dict: A dictionary containing processed fragmentation data, including:
@@ -394,12 +427,21 @@ class SpecMolFragDataset(SpecMolDataset):
         # case use frag dags as second gnn
         if self.frag_params["pyg"]:
             frag_pyg = frag_entry["dag"]
+            gasteiger_arr = None
+            if mol is not None and "frag_q" in self.frag_params["pyg_node_feats"]:
+                AllChem.ComputeGasteigerCharges(mol)
+                charges = np.array(
+                    [a.GetDoubleProp("_GasteigerCharge") for a in mol.GetAtoms()],
+                    dtype=np.float32,
+                )
+                gasteiger_arr = np.where(np.isfinite(charges), charges, 0.0).astype(np.float32)
             frag_pyg = get_frag_graph(
                 frag_pyg,
                 self.frag_params["pyg_node_feats"],
                 self.frag_params["pyg_edge_feats"],
                 self.frag_params["pyg_edges"],
                 self.frag_params["pyg_bigraph"],
+                gasteiger_arr=gasteiger_arr,
             )
             frag_data["frag_pyg"] = frag_pyg
 
@@ -421,14 +463,66 @@ class SpecMolFragDataset(SpecMolDataset):
             formula_peak_mzs = formula_peak_mzs[:, : self.frag_params["num_isotopes"]]
             frag_data["frag_formula_peak_mzs"] = formula_peak_mzs
 
+        # Consumed and removed by _apply_fragment_mz_change, which is the first thing every
+        # caller runs; it never reaches the batch.
+        frag_data[FORMULA_ELEMENT_COUNTS_KEY] = th.tensor(
+            [tracked_element_counts(formula) for formula in frag_entry["idx_to_formula"].values()],
+            dtype=th.int32,
+        )
+
         return frag_data
+
+    @staticmethod
+    def _impossible_formula_rows(
+        element_counts: th.Tensor, prec_type: str, *, cmf: bool
+    ) -> th.Tensor | None:
+        """Flag formula rows whose ion this precursor delta cannot actually form.
+
+        A loss-type delta is subtracted from every enumerated fragment, but a fragment that
+        never carried the lost group would need a negative element count, or would be left
+        with no atoms at all. Returns ``None`` when the delta removes nothing.
+        """
+        removed = prec_type_removed_counts(prec_type, cmf=cmf)
+        if not removed:
+            return None
+        impossible = th.zeros(element_counts.shape[0], dtype=th.bool)
+        for position, amount in removed.items():
+            impossible |= element_counts[:, position] < amount
+        return impossible
+
+    @staticmethod
+    def _null_impossible_channels(
+        formula_matrix: th.Tensor, impossible_rows: th.Tensor | None
+    ) -> th.Tensor:
+        """Point channels whose ion cannot exist at the NULL formula, like an absent H shift."""
+        if impossible_rows is None:
+            return formula_matrix
+        return th.where(impossible_rows[formula_matrix.long()], 0, formula_matrix)
+
+    @staticmethod
+    def _max_h_transfer(frag_pyg) -> int:
+        """Recover the DAG's hydrogen-transfer limit from the CRF formula feature block.
+
+        The block is built with one column per reachable shift, ``1 + 2 * max_h_transfer``.
+        """
+        frag_node_feat_idxs = frag_pyg.node_feat_idxs[0]
+        crf_node_feat_idx = NODE_FEAT_TO_IDX["h_formulae_idx"]
+        num_columns = int(
+            frag_node_feat_idxs[crf_node_feat_idx + 1] - frag_node_feat_idxs[crf_node_feat_idx]
+        )
+        return (num_columns - 1) // 2
 
     def _apply_fragment_mz_change(
         self, frag_data: dict, prec_type: str, neutral_peaks: th.Tensor, clone_pyg: bool = False
     ) -> dict:
         """
-        Apply precursor mass difference for Charge Remote Fragmentation (CRF) and
-        Charge Migration Fragmentation (CMF) to frag_data.
+        Apply precursor mass difference for charge retention fragmentation (CRF) and
+        charge migration fragmentation (CMF) to frag_data.
+
+        Note:
+            CRF here is charge *retention*, not the unrelated charge-*remote* fragmentation
+            of Gross and co-workers, which describes cleavage at a bond away from the charge
+            site. The acronym collides; the mechanism modelled here is carrier retention.
 
         This method updates 'frag_formula_peak_mzs', 'frag_formula_peak_probs',
         'frag_formula_str', and 'frag_pyg' in frag_data.
@@ -445,14 +539,26 @@ class SpecMolFragDataset(SpecMolDataset):
         """
         prec_type_mass_diff = PREC_TYPE_TO_MASS_DIFF[prec_type]
         crf_peaks = neutral_peaks + prec_type_mass_diff
+        # Unit-test fixtures build frag_data by hand; without counts the validity check is
+        # skipped and every enumerated channel is kept, as before.
+        element_counts = frag_data.pop(FORMULA_ELEMENT_COUNTS_KEY, None)
+        crf_impossible = (
+            None
+            if element_counts is None
+            else self._impossible_formula_rows(element_counts, prec_type, cmf=False)
+        )
+        if clone_pyg and frag_data.get("frag_pyg") is not None:
+            frag_data["frag_pyg"] = frag_data["frag_pyg"].clone()
 
-        # Charge Migration Fragmentation stuff
-        if self.frag_params["include_cmf"] and prec_type not in [
-            "[M+H]+",
-            "[M-H]-",
-            "[M]+",
-            "[M-]",
-        ]:
+        # Charge Migration Fragmentation stuff. Adducts whose CMF ion is already enumerated
+        # as a CRF hydrogen shift are skipped: emitting both would put two formula slots on
+        # one m/z, splitting the softmax between indistinguishable states.
+        if (
+            self.frag_params["include_cmf"]
+            and prec_type in PREC_TYPE_TO_CMF_MASS_DIFF
+            and cmf_duplicate_crf_h_shift(prec_type, self._max_h_transfer(frag_data["frag_pyg"]))
+            is None
+        ):
             # Check if cmf_h_formulae_idx exists in pyg node features:
             assert "cmf_h_formulae_idx" in self.frag_params["pyg_node_feats"], (
                 "cmf_h_formulae_idx not in pyg_node_feats"
@@ -478,11 +584,7 @@ class SpecMolFragDataset(SpecMolDataset):
                 )
 
             # update pyg
-            if clone_pyg:
-                frag_pyg = frag_data["frag_pyg"].clone()
-            else:
-                frag_pyg = frag_data["frag_pyg"]
-
+            frag_pyg = frag_data["frag_pyg"]
             frag_node_feat_idxs = frag_pyg.node_feat_idxs[0]
             crf_node_feat_idx = NODE_FEAT_TO_IDX["h_formulae_idx"]
             cmf_node_feat_idx = NODE_FEAT_TO_IDX["cmf_h_formulae_idx"]
@@ -491,18 +593,36 @@ class SpecMolFragDataset(SpecMolDataset):
                 frag_node_feat_idxs[crf_node_feat_idx] : frag_node_feat_idxs[crf_node_feat_idx + 1],
             ]
 
-            # update cmf formula matrix if crf_formula_matrix value is not zero
-            # if crf_formula_matrix is zero, that means h_transfer is not possible, then cmf formula matrix should be zero
-            # cmf formula matrix is shifted by num_formulae-1, as forumlea[0] is null formula
+            # Reject impossible CMF ions while the indices still address neutral formula rows,
+            # then shift the survivors into the appended CMF half of the formula arrays.
+            cmf_formula_matrix = crf_formula_matrix
+            if element_counts is not None:
+                cmf_formula_matrix = self._null_impossible_channels(
+                    cmf_formula_matrix,
+                    self._impossible_formula_rows(element_counts, prec_type, cmf=True),
+                )
             frag_pyg.x[
                 :,
                 frag_node_feat_idxs[cmf_node_feat_idx] : frag_node_feat_idxs[cmf_node_feat_idx + 1],
             ] = th.where(
-                crf_formula_matrix != 0, crf_formula_matrix + num_formulae - 1, crf_formula_matrix
+                cmf_formula_matrix != 0, cmf_formula_matrix + num_formulae - 1, cmf_formula_matrix
             )
             frag_data["frag_pyg"] = frag_pyg
         else:
             frag_data["frag_formula_peak_mzs"] = crf_peaks
+
+        if crf_impossible is not None:
+            frag_pyg = frag_data["frag_pyg"]
+            frag_node_feat_idxs = frag_pyg.node_feat_idxs[0]
+            crf_node_feat_idx = NODE_FEAT_TO_IDX["h_formulae_idx"]
+            crf_slice = slice(
+                int(frag_node_feat_idxs[crf_node_feat_idx]),
+                int(frag_node_feat_idxs[crf_node_feat_idx + 1]),
+            )
+            frag_pyg.x[:, crf_slice] = self._null_impossible_channels(
+                frag_pyg.x[:, crf_slice], crf_impossible
+            )
+            frag_data["frag_pyg"] = frag_pyg
         return frag_data
 
     def get_collate_fn(self):

@@ -16,6 +16,8 @@ import pandas as pd
 import pytest
 
 from fragnnet.dataset.base_dataset import BaseDataset
+from fragnnet.utils import data_utils
+from fragnnet.utils.formula_utils import PREC_TYPE_TO_MASS_DIFF
 
 # ============================================================================
 # Helpers
@@ -46,13 +48,18 @@ def _make_mol_df(mol_ids: list[int]) -> pd.DataFrame:
     return pd.DataFrame({"mol_id": mol_ids})
 
 
-def _make_split_dir(split_name: str, spec_ids: list[int], mol_ids: list[int]) -> str:
-    """Write a <split>_ids.csv to a temp directory and return the directory path."""
-    tmp = tempfile.mkdtemp()
+def _write_split_file(
+    split_dp: str, split_name: str, spec_ids: list[int], mol_ids: list[int]
+) -> None:
+    """Write a <split>_ids.csv into an existing directory.
+
+    Takes the directory rather than creating one: this used to call mkdtemp() and never
+    remove it, so every test run left one directory per test behind in /tmp (thousands of
+    them accumulated).
+    """
     pd.DataFrame({"spec_id": spec_ids, "mol_id": mol_ids}).to_csv(
-        os.path.join(tmp, f"{split_name}_ids.csv"), index=False
+        os.path.join(split_dp, f"{split_name}_ids.csv"), index=False
     )
-    return tmp
 
 
 def _base_spec_params(**overrides) -> dict:
@@ -82,6 +89,21 @@ def _base_spec_params(**overrides) -> dict:
     return defaults
 
 
+def _spectrum_cleanup_params(**overrides) -> dict:
+    defaults = {
+        "centroid_peaks": False,
+        "centroid_ppm": 20.0,
+        "centroid_use_instrument_tolerance": False,
+        "centroid_method": "common_overlap",
+        "filter_subformula_peaks": False,
+        "subformula_ppm": 5.0,
+        "subformula_use_instrument_tolerance": True,
+        "drop_empty_spectra": True,
+    }
+    defaults.update(overrides)
+    return defaults
+
+
 def _run_setup_dfs(
     spec_df: pd.DataFrame,
     mol_df: pd.DataFrame,
@@ -89,19 +111,21 @@ def _run_setup_dfs(
     spec_params: dict,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Run BaseDataset._setup_dfs and return (spec_df, mol_df)."""
-    split_dp = _make_split_dir(
-        split_name,
-        spec_ids=spec_df["spec_id"].tolist(),
-        mol_ids=spec_df["mol_id"].tolist(),
-    )
-    result = BaseDataset._setup_dfs(
-        spec_fp_or_df=spec_df,
-        mol_fp_or_df=mol_df,
-        split_dp=split_dp,
-        splits=[split_name],
-        subsample_params={},
-        spec_params=spec_params,
-    )
+    with tempfile.TemporaryDirectory() as split_dp:
+        _write_split_file(
+            split_dp,
+            split_name,
+            spec_ids=spec_df["spec_id"].tolist(),
+            mol_ids=spec_df["mol_id"].tolist(),
+        )
+        result = BaseDataset._setup_dfs(
+            spec_fp_or_df=spec_df,
+            mol_fp_or_df=mol_df,
+            split_dp=split_dp,
+            splits=[split_name],
+            subsample_params={},
+            spec_params=spec_params,
+        )
     out_spec_df, out_mol_df = result[0], result[1]
     return out_spec_df, out_mol_df
 
@@ -550,3 +574,138 @@ class TestCombinedFilter:
         assert 4 not in mol_ids  # spec 7 (only spec for mol 4) dropped
         assert 6 not in mol_ids  # spec 10 ([M+Na]+) dropped
         assert {1, 3, 5}.issubset(mol_ids)  # these mols still have surviving spectra
+
+
+class TestSpectrumCleanup:
+    def test_template_cleanup_settings_only_drop_preexisting_empty_spectra(self):
+        peaks = [(100.0, 1.0), (100.001, 2.0)]
+        spec_df = _make_spec_df(
+            [
+                {
+                    "spec_id": 1,
+                    "mol_id": 1,
+                    "group_id": 1,
+                    "prec_type": "[M+H]+",
+                    "inst_type": "FT",
+                    "nce": 20.0,
+                    "ace": 10.0,
+                    "prec_mz": 101.0,
+                    "peaks": peaks,
+                },
+                {
+                    "spec_id": 2,
+                    "mol_id": 2,
+                    "group_id": 2,
+                    "prec_type": "[M+H]+",
+                    "inst_type": "FT",
+                    "nce": 20.0,
+                    "ace": 10.0,
+                    "prec_mz": 101.0,
+                    "peaks": [],
+                },
+            ]
+        )
+        mol_df = _make_mol_df([1, 2])
+        params = _base_spec_params(**_spectrum_cleanup_params())
+
+        out_spec, out_mol = _run_setup_dfs(spec_df, mol_df, "train", params)
+
+        assert out_spec["spec_id"].tolist() == [1]
+        assert out_spec.loc[0, "peaks"] == peaks
+        assert out_mol["mol_id"].tolist() == [1]
+
+    @pytest.mark.parametrize(
+        ("use_instrument_tolerance", "expected_spec_ids"),
+        [(True, [1]), (False, [])],
+    )
+    def test_subformula_instrument_tolerance_overrides_fixed_ppm(
+        self, use_instrument_tolerance, expected_spec_ids
+    ):
+        theoretical_mz = (
+            data_utils.formula_to_mass("CH4")
+            + PREC_TYPE_TO_MASS_DIFF["[M+H]+"]
+        )
+        spec_df = _make_spec_df(
+            [
+                {
+                    "spec_id": 1,
+                    "mol_id": 1,
+                    "group_id": 1,
+                    "prec_type": "[M+H]+",
+                    "inst_type": "QTOF",
+                    "nce": 20.0,
+                    "ace": 10.0,
+                    "prec_mz": theoretical_mz,
+                    "peaks": [(theoretical_mz + 0.01, 1.0)],
+                }
+            ]
+        )
+        mol_df = pd.DataFrame({"mol_id": [1], "formula": ["CH4"]})
+        params = _base_spec_params(
+            **_spectrum_cleanup_params(
+                filter_subformula_peaks=True,
+                subformula_ppm=5.0,
+                subformula_use_instrument_tolerance=use_instrument_tolerance,
+            )
+        )
+
+        out_spec, out_mol = _run_setup_dfs(spec_df, mol_df, "train", params)
+
+        assert out_spec["spec_id"].tolist() == expected_spec_ids
+        assert out_mol["mol_id"].tolist() == expected_spec_ids
+
+    def test_centroid_and_subformula_filter_run_during_dataframe_preprocessing(self):
+        carbon_ion_mz = data_utils.formula_to_mass("C") - data_utils.ELECTRON_MASS
+        spec_df = _make_spec_df(
+            [
+                {
+                    "spec_id": 1,
+                    "mol_id": 1,
+                    "group_id": 1,
+                    "prec_type": "[M]+",
+                    "inst_type": "FT",
+                    "nce": 20.0,
+                    "ace": 10.0,
+                    "prec_mz": 16.0,
+                    "peaks": [
+                        (carbon_ion_mz - 2e-5, 1.0),
+                        (carbon_ion_mz + 2e-5, 3.0),
+                        (50.0, 2.0),
+                    ],
+                },
+                {
+                    "spec_id": 2,
+                    "mol_id": 2,
+                    "group_id": 2,
+                    "prec_type": "[M]+",
+                    "inst_type": "FT",
+                    "nce": 20.0,
+                    "ace": 10.0,
+                    "prec_mz": 16.0,
+                    "peaks": [(50.0, 2.0)],
+                },
+            ]
+        )
+        mol_df = pd.DataFrame(
+            {"mol_id": [1, 2], "formula": ["CH4", "CH4"]}
+        )
+        params = _base_spec_params(
+            prec_types=["[M]+"],
+            **_spectrum_cleanup_params(
+                centroid_peaks=True,
+                filter_subformula_peaks=True,
+                drop_empty_spectra=True,
+            ),
+        )
+
+        out_spec, out_mol = _run_setup_dfs(spec_df, mol_df, "train", params)
+
+        assert out_spec["spec_id"].tolist() == [1]
+        assert out_mol["mol_id"].tolist() == [1]
+        assert out_spec.loc[0, "peaks"] == pytest.approx([(carbon_ion_mz + 1e-5, 4.0)])
+
+    def test_partial_cleanup_config_is_rejected(self, mixed_spec_df, mixed_mol_df):
+        params = _base_spec_params(centroid_peaks=True)
+
+        with pytest.raises(ValueError, match="missing required spectrum cleanup settings"):
+            _run_setup_dfs(mixed_spec_df, mixed_mol_df, "train", params)

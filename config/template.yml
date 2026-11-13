@@ -47,13 +47,22 @@ spec_params:
   nce: False
   ace: False
   preprocess: False
+  # Per-spectrum peak cleanup, applied before replicate-spectrum merging.
+  centroid_peaks: False
+  centroid_ppm: 20.0
+  centroid_use_instrument_tolerance: False
+  centroid_method: common_overlap  # ["common_overlap", "naive_centroid"]
+  filter_subformula_peaks: False  # when True, candidates always include charge-migration ions ([M+Na]+ -> [frag+H]+, [M+Cl]- -> [frag-H]-)
+  subformula_ppm: 5.0 # only use if filter_subformula_peaks is True and subformula_use_instrument_tolerance is False
+  subformula_use_instrument_tolerance: True
+  drop_empty_spectra: True
   # Monoisotopic target cleanup. When True, isotope peaks are removed from
   # observed spectra before they become training/evaluation targets; isotope
   # envelopes can then be added back as a post-process.
   remove_isotope_peaks: False
-  remove_regular_isotope_peaks: True
-  remove_coisolation_peaks: True
-  remove_isotope_use_group_f: True
+  remove_regular_isotope_peaks: False
+  remove_coisolation_peaks: False
+  remove_isotope_use_group_f: False
   remove_isotope_max_isotope: 2
   remove_isotope_min_coiso_fraction: 0.05
   remove_isotope_max_leak_factor: 1.5
@@ -61,9 +70,9 @@ spec_params:
   remove_isotope_precursor_envelope_hi: 5.0
   remove_isotope_group_min_count: 1
   remove_isotope_group_max_cv: 1.0
-  remove_isotope_use_dag_formula: True
+  remove_isotope_use_dag_formula: False
   remove_isotope_dag_dp:
-  remove_isotope_dag_compressed: True
+  remove_isotope_dag_compressed: False
   remove_isotope_dag_mz_tol: 0.015
   remove_isotope_protect_dag_mono: False
   remove_isotope_regular_mz_tol:
@@ -109,8 +118,12 @@ mol_params:
     - a_ring
     - a_mass
     - a_chiral
+    # - a_ring_size # ring size membership: [in3, in4, in5, in6, inGe7]; no DAG recomputation needed
+    # - a_charge    # Gasteiger partial charge (continuous); computed on-the-fly, no DAG recomputation needed
   pyg_edge_feats:
     - b_degree
+    # - b_ring      # bond ring membership (2 bits); no DAG recomputation needed
+    # - b_conj      # bond conjugation (2 bits); no DAG recomputation needed
   pyg_pe_embed_k: 0
   pyg_bigraph: True
   mf: False
@@ -128,7 +141,7 @@ frag_params:
     # - nb_iso_idx          # isotope index; requires nb_iso=True
     # - prepass_rule_id     # one-hot over FRAG_RULES (len(FRAG_RULES) dims); all-zero = BFS fragment; requires smarts_prepass=True at preprocessing time
     # - boundary_cc         # atoms at cut bonds; computed on-the-fly from mol graph, not stored in DAG
-    # - boundary_pair       # cut-bond pair encoding: Linear(cat(inside_atom_embed, outside_atom_embed)) pooled over cuts; requires cc
+    # - boundary_pair       # cut-bond pair encoding pooled over precomputed cut atom pairs; does not expose full-fragment cc
   pyg_edge_feats:
     - cc
     - base_formula
@@ -142,6 +155,11 @@ frag_params:
   compressed: True
   preload: False
   preprocess: False
+  # Per-molecule LRU of processed neutral DAGs, used whenever preload/preprocess are off
+  # (which apply_inference_config forces for every inference run). __getitem__ is
+  # per-spectrum but a DAG is per-molecule, so without this every collision energy of a
+  # molecule re-reads and re-builds the same graph. 0 disables.
+  cache_size: 16
   include_cmf: False
 magma_params:
   pe_embed_k: 0
@@ -191,6 +209,7 @@ output_formula_str: False  # Output formula as string (slower but useful for deb
 clip_temperature: 0.07
 clip_embed_dim: 256
 clip_intensity_transform: sqrt  # ["sqrt", "log1p", "none"]
+clip_loss_type: clip  # ["clip", "siglip", "soft_clip"]; soft_clip requires mol_params.fingerprint=True
 spectrum_encoder_params:
   encoder_type: set_transformer
   input_dim: 2
@@ -212,7 +231,7 @@ mol_gnn_type: GINE  # GNN architecture: ["GIN", "GINE", "GCN", "GAT", "PNA"]
 mol_dropout: 0.0  # Dropout rate for molecular GNN
 mol_normalization: batch  # Normalization: ["batch", "layer", "none"]
 mol_pool_type: none  # Pooling method for molecular embeddings: ["sum", "mean", "max", "attention", "mean_max_sum", "none"]
-mol_num_heads: 4  # Number of attention heads (GINE_EFA only); must divide mol_hidden_size
+mol_num_heads: 4  # Number of attention heads (GINE_GSA only); must divide mol_hidden_size
 
 # ============================================================================
 # Inter-stage Configuration (Mol → Frag connection)
@@ -335,9 +354,9 @@ auxiliary_scores:
   - true_oos_prob
   - true_oos_e
 # Target/true-spectrum filtering during SpectrumPL preprocessing.
-# target_ints_thresh applies to true spectra for both training and evaluation.
-# ints_thresh is the legacy name and is still supported as a fallback.
-target_ints_thresh: 0.0
+# target_rel_ints_thresh: per-spectrum relative threshold (0.0-1.0); e.g. 0.01 drops peaks
+#   below 1% of that spectrum's maximum intensity.
+target_rel_ints_thresh: 0.0
 train_target_top_k_peaks: -1
 train_target_drop_min_int_peak: False
 eval_target_apply_train_rank_filters: False
@@ -354,6 +373,7 @@ sum_ints: True
 ints_transform: none # none, sqrt, log10, log10t3, loge
 train_batch_size: 16
 eval_batch_size: 16
+retrieval_eval_size:  # max spectra for retrieval eval; null = disabled (CLIP models only)
 accelerator: cpu
 devices: auto
 logging:
@@ -406,6 +426,10 @@ joint_normalized_entropy_weight: 0.0
 pairwise_cosine_loss_weight: 0.0 
 pairwise_jss_loss_weight: 0.0
 pairwise_cross_entropy_loss_weight: 0.0
+# cross-matrix JSS contrastive: JSS-sqrt(real_i, pred_j), InfoNCE row-wise
+cross_jss_contrastive_loss_weight: 0.0
+cross_jss_contrastive_temperature: 0.07
+cross_jss_contrastive_sqrt: true
 # nb stuff, set all to 0 to disable
 nb_iso: False
 nb_node_entropy_weight: 0.0
@@ -501,6 +525,13 @@ frag_mode_scale: False           # Enable mode-conditioned affine output scaling
 # CE-conditioned FiLM output scaling (temperature-style)
 ce_scale: False              # Enable CE-conditioned FiLM scaler on logits before softmax
 ce_scaler_hidden_dim: 64     # Hidden dim of the CE→FiLM MLP
+
+# Categorical FiLM output scaling (adduct type and acquisition stratum)
+adduct_scale: False           # §3a: Enable adduct-type FiLM output scaling (prec_type token)
+stratum_scale: False          # §3b: Enable combined inst/frag_mode/adduct FiLM output scaling
+stratum_scaler_embed_dim: 16  # Embedding dim for each categorical axis in StratumScaler
+# Note: adduct_scale and stratum_scale are independent ablation toggles.
+# stratum_scale subsumes adduct_scale — do not enable both simultaneously.
 
 # ============================================================================
 # MCES Pre-training Configuration

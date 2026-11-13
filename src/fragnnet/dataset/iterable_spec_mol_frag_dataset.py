@@ -15,9 +15,29 @@ class IterableSpecMolFragDataset(IterableDataset):
     or frag edges per batch does not exceed `max_num`.
 
     This is intended for inference: provide an `index_stream` that yields
-    integer dataset indices (e.g., iter(range(len(dataset)))) and the
-    wrapper yields either collated batch dicts (default) or lists of
-    sample dicts.
+    integer dataset indices (e.g. ``range(len(dataset))``) and the wrapper
+    yields either collated batch dicts (default) or lists of sample dicts.
+
+    Batches are formed lazily as the stream is consumed, so nothing here needs
+    `len(dataset)`, a size cache (`precom_meta_info`), or an up-front pass that
+    loads every sample once just to plan batches. Sizing happens in the worker
+    as samples arrive, which also keeps the main process from touching the
+    dataset (and so from opening an HDF5 handle before workers fork).
+
+    Two wiring requirements follow from that:
+
+    - Pair it with ``DataLoader(..., batch_size=None)``, since the batches are
+      already collated; otherwise they get batched a second time.
+    - The batch count is unknown until the stream is exhausted, so this class
+      has no ``__len__`` and neither does a DataLoader wrapping it.
+
+    With ``num_workers > 0`` the stream is sharded round-robin across workers,
+    so prefer a re-sliceable `Sequence` (``range``/``list``) over a generator.
+
+    ``limited_by`` defaults to ``frag_node`` to match `dynamic_batch_sampler_mode`
+    in the config template. Only pick ``frag_edge`` for a config that actually
+    materializes fragment edges; otherwise every sample measures 0 and batching
+    silently stops bounding anything (guarded against in `_sample_size`).
     """
 
     def __init__(
@@ -25,7 +45,7 @@ class IterableSpecMolFragDataset(IterableDataset):
         dataset: Any,
         index_stream: Iterable[int],
         max_num: int,
-        limited_by: str = "frag_edge",
+        limited_by: str = "frag_node",
         skip_too_big: bool = False,
         return_collated: bool = True,
         clone_graphs_on_get: bool = True,
@@ -45,51 +65,58 @@ class IterableSpecMolFragDataset(IterableDataset):
         self._clone_graphs_on_get = clone_graphs_on_get
         self._drop_last = drop_last
 
-    def __iter__(self) -> Iterator:
-        # Support multi-worker by sharding the provided index_stream per-worker.
+    def _shard_indices(self) -> Iterator[int]:
+        """Return this worker's slice of the index stream (all of it when single-process)."""
         worker_info = get_worker_info()
-
-        # Build a per-worker index iterable
         if worker_info is None:
-            indices_iter = iter(self.index_stream)
-        else:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
+            return iter(self.index_stream)
 
-            # Use islice or sequence slicing to shard indices across workers.
-            # This avoids materializing the whole stream in each worker if it's
-            # already an iterator/generator.
-            if isinstance(self.index_stream, Sequence):
-                try:
-                    indices_iter = iter(self.index_stream[worker_id::num_workers])
-                except Exception:
-                    indices_iter = itertools.islice(self.index_stream, worker_id, None, num_workers)
-            else:
-                indices_iter = itertools.islice(self.index_stream, worker_id, None, num_workers)
+        worker_id = worker_info.id
+        num_workers = worker_info.num_workers
+        if isinstance(self.index_stream, Sequence):
+            return iter(self.index_stream[worker_id::num_workers])
+        # A bare iterator is forked per worker, so each one strides its own copy.
+        return itertools.islice(self.index_stream, worker_id, None, num_workers)
 
-        batch_samples = []
+    def _sample_size(self, sample: dict, idx: int) -> int:
+        if "frag_pyg" not in sample:
+            # Treating this as size 0 would let a batch grow without bound and OOM.
+            raise KeyError(
+                f"sample at index {idx} has no 'frag_pyg'; "
+                f"{type(self).__name__} sizes batches by fragment graph size"
+            )
+        pyg = sample["frag_pyg"]
+        n = int(pyg.num_nodes) if self._limited_by == "frag_node" else int(pyg.num_edges)
+        if n == 0:
+            # Every sample measuring 0 would never reach max_num, so the whole stream
+            # would collect into one batch and OOM. `frag_edge` hits this whenever the
+            # model config does not materialize fragment edges (num_edges is then 0 for
+            # every sample) -- `frag_node` is always populated.
+            raise ValueError(
+                f"sample at index {idx} has {self._limited_by}=0, so it cannot bound a "
+                f"batch. If this is every sample, the config does not populate "
+                f"{self._limited_by}; use limited_by='frag_node' instead."
+            )
+        return n
+
+    def __iter__(self) -> Iterator:
+        indices_iter = self._shard_indices()
+        collate_fn = self.dataset.get_collate_fn() if self._return_collated else None
+
+        def emit(samples: list[dict]):
+            return collate_fn(samples) if collate_fn is not None else samples
+
+        batch_samples: list[dict] = []
         batch_count = 0
-
-        def sample_size(sample: dict) -> int:
-            if "frag_pyg" not in sample:
-                return 0
-            pyg = sample["frag_pyg"]
-            if self._limited_by == "frag_node":
-                return int(pyg.num_nodes)
-            return int(pyg.num_edges)
 
         for idx in indices_iter:
             sample = self.dataset[idx]
-            # Optionally clone PyG objects if dataset caches them to avoid
-            # in-place modifications affecting future samples.
+            # Clone when the dataset caches and hands back shared PyG objects, so a
+            # later in-place edit cannot reach a sample already queued in this batch.
             if self._clone_graphs_on_get and "frag_pyg" in sample:
-                try:
-                    sample["frag_pyg"] = sample["frag_pyg"].clone()
-                except Exception:
-                    # If clone not supported, ignore and use as-is
-                    pass
+                sample["frag_pyg"] = sample["frag_pyg"].clone()
 
-            n = sample_size(sample)
+            n = self._sample_size(sample, idx)
 
             if n > self._max_num:
                 if self._skip_too_big:
@@ -97,19 +124,13 @@ class IterableSpecMolFragDataset(IterableDataset):
                         f"Skipping sample at index {idx} with size {n} (max_num={self._max_num})"
                     )
                     continue
-                else:
-                    logger.debug(
-                        f"Sample at index {idx} with size {n} exceeds max_num={self._max_num}. "
-                        "Yielding as a single-sample batch."
-                    )
+                logger.debug(
+                    f"Sample at index {idx} with size {n} exceeds max_num={self._max_num}. "
+                    "Yielding as a single-sample batch."
+                )
 
             if batch_count + n > self._max_num and len(batch_samples) > 0:
-                # yield current batch
-                if self._return_collated:
-                    collate_fn = self.dataset.get_collate_fn()
-                    yield collate_fn(batch_samples)
-                else:
-                    yield batch_samples
+                yield emit(batch_samples)
                 batch_samples = []
                 batch_count = 0
 
@@ -120,13 +141,4 @@ class IterableSpecMolFragDataset(IterableDataset):
 
         # flush leftover
         if len(batch_samples) > 0 and not self._drop_last:
-            if self._return_collated:
-                collate_fn = self.dataset.get_collate_fn()
-                yield collate_fn(batch_samples)
-            else:
-                yield batch_samples
-
-    def __len__(self) -> int:
-        # Length is undefined for streaming iterators; return 0 to avoid
-        # misleading behavior. Users should not rely on len() here.
-        return 0
+            yield emit(batch_samples)

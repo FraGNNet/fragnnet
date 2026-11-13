@@ -13,7 +13,6 @@ from torch.utils.data import DataLoader, RandomSampler
 from fragnnet.dataset import (
     DualGroupDynamicBatchSampler,
     FormulaPrecTypeGroupSampler,
-    GreedyInferenceBatchSampler,
     GroupSampler,
     SpecMolFragDynamicBatchSampler,
 )
@@ -100,6 +99,17 @@ class DS2:
 
 class TestSpecMolFragDynamicBatchSampler:
     """Tests for dynamic batch sampling with node/edge constraints."""
+
+    def test_dynamic_batch_sampler_empty_dataset(self):
+        """Test an empty split produces no batches."""
+        ds = FakeDataset([])
+
+        sampler = SpecMolFragDynamicBatchSampler(
+            data_source=ds, max_num=10, limited_by="frag_node"
+        )
+
+        assert list(sampler) == []
+        assert len(sampler) == 0
 
     def test_dynamic_batch_sampler(self):
         """Test basic dynamic batch sampler functionality."""
@@ -934,117 +944,6 @@ class TestDataloaderSmoke:
         for b in batches:
             total_nodes = sum(samples[i]["frag_pyg"].num_nodes for i in b)
             assert total_nodes <= 6
-
-
-# ============================================================================
-# Tests for GreedyInferenceBatchSampler
-# ============================================================================
-
-
-class TestGreedyInferenceBatchSampler:
-    """Tests for greedy sequential inference batch sampling."""
-
-    def _make_ds(self, sizes):
-        """Build a FakeDataset from a list of (nodes, edges) tuples."""
-        return FakeDataset(sizes)
-
-    def test_all_indices_covered_exactly_once(self):
-        """Every dataset index must appear in exactly one batch."""
-        sizes = [(3, 2), (5, 4), (1, 1), (8, 6), (2, 2), (4, 3)]
-        ds = self._make_ds(sizes)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=10, limited_by="frag_edge")
-        all_indices = [i for batch in sampler for i in batch]
-        assert sorted(all_indices) == list(range(len(sizes)))
-
-    def test_sequential_order_preserved(self):
-        """Indices must appear in ascending sequential order across batches."""
-        sizes = [(2, 1)] * 8
-        ds = self._make_ds(sizes)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=6, limited_by="frag_edge")
-        all_indices = [i for batch in sampler for i in batch]
-        assert all_indices == sorted(all_indices)
-
-    def test_batch_edge_budget_respected(self):
-        """No batch should exceed max_num edges (except oversized singletons)."""
-        sizes = [(1, 3), (1, 4), (1, 5), (1, 2), (1, 3)]
-        ds = self._make_ds(sizes)
-        max_num = 7
-        sampler = GreedyInferenceBatchSampler(ds, max_num=max_num, limited_by="frag_edge")
-        for batch in sampler:
-            if len(batch) > 1:
-                total = sum(sizes[i][1] for i in batch)
-                assert total <= max_num
-
-    def test_batch_node_budget_respected(self):
-        """No batch should exceed max_num nodes (except oversized singletons)."""
-        sizes = [(3, 1), (4, 2), (2, 1), (5, 3), (3, 2)]
-        ds = self._make_ds(sizes)
-        max_num = 8
-        sampler = GreedyInferenceBatchSampler(ds, max_num=max_num, limited_by="frag_node")
-        for batch in sampler:
-            if len(batch) > 1:
-                total = sum(sizes[i][0] for i in batch)
-                assert total <= max_num
-
-    def test_oversized_singleton_emitted(self):
-        """A sample larger than max_num must be emitted as a singleton, not dropped."""
-        sizes = [(2, 2), (1, 100), (3, 3)]  # index 1 is oversized
-        ds = self._make_ds(sizes)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=10, limited_by="frag_edge")
-        all_indices = [i for batch in sampler for i in batch]
-        assert 1 in all_indices
-
-    def test_len_matches_iteration(self):
-        """__len__ must equal the number of batches yielded by iteration."""
-        sizes = [(3, 2), (5, 4), (1, 1), (8, 6), (2, 2), (4, 3)]
-        ds = self._make_ds(sizes)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=8, limited_by="frag_edge")
-        assert len(sampler) == len(list(sampler))
-
-    def test_deterministic_across_iterations(self):
-        """Multiple iterations must yield identical batches."""
-        sizes = [(3, 2), (5, 4), (1, 1), (8, 6), (2, 2)]
-        ds = self._make_ds(sizes)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=8, limited_by="frag_edge")
-        assert list(sampler) == list(sampler)
-
-    def test_precom_meta_info_cache_used(self):
-        """When dataset exposes precom_meta_info, no __getitem__ calls should be needed."""
-
-        class CachedDataset:
-            def __init__(self, meta):
-                self.precom_meta_info = meta
-
-            def __len__(self):
-                return len(self.precom_meta_info)
-
-            def __getitem__(self, idx):
-                raise AssertionError("__getitem__ must not be called when cache is present")
-
-        meta = [(1, 2), (3, 4), (2, 1), (5, 6)]
-        ds = CachedDataset(meta)
-        sampler = GreedyInferenceBatchSampler(ds, max_num=5, limited_by="frag_edge")
-        all_indices = [i for batch in sampler for i in batch]
-        assert sorted(all_indices) == list(range(len(meta)))
-
-    def test_invalid_max_num_raises(self):
-        """Non-positive max_num must raise ValueError."""
-        ds = self._make_ds([(1, 1)])
-        with pytest.raises(ValueError, match="max_num"):
-            GreedyInferenceBatchSampler(ds, max_num=0)
-
-    def test_invalid_limited_by_raises(self):
-        """Unknown limited_by value must raise ValueError."""
-        ds = self._make_ds([(1, 1)])
-        with pytest.raises(ValueError, match="limited_by"):
-            GreedyInferenceBatchSampler(ds, max_num=10, limited_by="frag_weight")
-
-    def test_single_sample_dataset(self):
-        """A single-sample dataset must produce exactly one batch with that index."""
-        ds = self._make_ds([(5, 3)])
-        sampler = GreedyInferenceBatchSampler(ds, max_num=10, limited_by="frag_edge")
-        batches = list(sampler)
-        assert batches == [[0]]
 
 
 if __name__ == "__main__":
