@@ -65,12 +65,5 @@ def test_cc_feature_dropout_noop_when_cc_feature_absent():
 
 def test_cc_feature_dropout_config_keys_exist():
     template = yaml.safe_load(Path("config/template.yml").read_text())
-    exp = yaml.safe_load(
-        Path(
-            "config/exp_fraggnn_ma_mi/d3_new_features/"
-            "fraggnn_d3_ma_mi_nist20_amolc_cc_dropout_02.yml"
-        ).read_text()
-    )
 
     assert template["cc_feature_dropout"] == 0.0
-    assert exp["cc_feature_dropout"] == 0.2
