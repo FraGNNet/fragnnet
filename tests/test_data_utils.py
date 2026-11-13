@@ -3,10 +3,43 @@
 Tests for normalization, tokenization, charge parsing, and energy conversions.
 """
 
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pytest
 
 from fragnnet.utils import data_utils as du
+
+
+def test_par_apply_uses_unordered_generator():
+    """Request unordered joblib results without changing the existing defaults."""
+    with patch.object(du.joblib, "Parallel") as parallel_cls:
+        du.par_apply([1], str, return_as_generator=True, n_jobs=2, unordered=True)
+
+    assert parallel_cls.call_args.kwargs["return_as"] == "generator_unordered"
+
+
+def test_par_apply_rejects_unordered_list():
+    """Unordered output is only defined for streaming results."""
+    with pytest.raises(ValueError, match="return_as_generator"):
+        du.par_apply([1], str, unordered=True)
+
+
+def test_par_apply_falls_back_for_older_joblib():
+    """A joblib/backend combo that rejects generator_unordered still streams ordered results."""
+    ordered_parallel = MagicMock(return_value=["result"])
+    with (
+        patch.object(
+            du.joblib,
+            "Parallel",
+            side_effect=[ValueError("unsupported return_as"), ordered_parallel],
+        ) as parallel_cls,
+        pytest.warns(RuntimeWarning, match="falling back"),
+    ):
+        result = du.par_apply([1], str, return_as_generator=True, n_jobs=2, unordered=True)
+
+    assert result == ["result"]
+    assert parallel_cls.call_args_list[1].kwargs["return_as"] == "generator"
 
 
 class TestNormalizeInts:
@@ -17,6 +50,15 @@ class TestNormalizeInts:
         norm = du.normalize_ints(vals)
         assert pytest.approx(sum(norm), rel=1e-9) == 1.0
         assert norm == [pytest.approx(1 / 6), pytest.approx(2 / 6), pytest.approx(3 / 6)]
+
+
+class TestFormulaMass:
+    """Tests for formula mass data used by subformula filtering."""
+
+    def test_formula_to_mass_uses_supported_monoisotopic_masses(self):
+        expected_mass = du.ELEMENT_TO_MASS["C"] + 4 * du.ELEMENT_TO_MASS["H"]
+
+        assert du.formula_to_mass("CH4") == pytest.approx(expected_mass)
 
 
 class TestSplitSmiles:
@@ -253,6 +295,76 @@ class TestCombineFormulae:
         # on pyteomics Composition parsing behaviour.
         result = du.combine_formulae("C2H6O", "CH4")
         assert isinstance(result, str) and len(result) > 0
+
+    def test_combine_exact_counts(self):
+        assert du.combine_formulae("C2H6O", "CH4") == "C3H10O1"
+
+    @pytest.mark.parametrize(
+        ("neutral", "delta", "expected"),
+        [
+            # Digit-free formulas in the one-letter amino-acid alphabet: pyteomics reads a
+            # positional string as a peptide sequence, so these used to come back as
+            # cysteine/pyrrolysine compositions (C -> C3H8N1O2S1).
+            ("C", "H1", "C1H1"),
+            ("N", "H1", "H1N1"),
+            ("O", "H1", "H1O1"),
+            ("CO", "H1", "C1H1O1"),
+            ("CN", "H1", "C1H1N1"),
+            ("CNO", "H1", "C1H1N1O1"),
+            # Negative deltas ([M-H]-) and multi-element adducts must also survive.
+            ("C7H6O2", "H-1", "C7H5O2"),
+            ("C", "Na1", "C1Na1"),
+            ("CO", "", "C1O1"),
+        ],
+    )
+    def test_amino_acid_letter_formulae_are_not_peptides(self, neutral, delta, expected):
+        assert du.combine_formulae(neutral, delta) == expected
+
+    def test_composition_argument_is_accepted(self):
+        from pyteomics.mass import Composition
+
+        assert du.combine_formulae(Composition(formula="CO"), "H1") == "C1H1O1"
+
+    def test_dict_argument_is_accepted(self):
+        # The isinstance(str) branch must not be the only one that normalises: a plain
+        # mapping still has to reach Composition rather than hitting dict + dict.
+        assert du.combine_formulae({"C": 1, "O": 1}, "H1") == "C1H1O1"
+
+
+class TestParseAnnotationsPrecursorParsing:
+    """`parse_annotations` parses the molecular formula, not a peptide sequence.
+
+    Hill notation drops the "1" on count-one elements, so a molecule whose every element
+    appears once ("CHN", "CHNO") is a digit-free string in the one-letter amino-acid
+    alphabet. Read positionally, pyteomics takes it as a sequence: the precursor, and every
+    product and neutral loss derived from it, come back as a peptide's composition.
+    """
+
+    @staticmethod
+    def _row(formula, prec_type="[M+H]+"):
+        return {
+            "peaks": '50.0 100 "p"',
+            "prec_type": prec_type,
+            "dset": "nist20_hr",
+            "formula": formula,
+            "notes": "",
+        }
+
+    @pytest.mark.parametrize("formula", ["CHN", "CHNO", "CHNOS"])
+    def test_digit_free_formula_is_not_read_as_a_peptide(self, formula):
+        from pyteomics.mass import Composition
+
+        _, products, _, _, _, error = du.parse_annotations(self._row(formula))
+        assert error == repr(None), error
+        expected = Composition(formula=formula)
+        expected["H"] += 1  # [M+H]+
+        # "p" annotates the precursor peak, so the product is the protonated molecule.
+        assert products == [du.composition_to_string(expected)]
+
+    def test_formula_with_digits_is_unaffected(self):
+        _, products, _, _, _, error = du.parse_annotations(self._row("C8H10N4O2"))
+        assert error == repr(None), error
+        assert products == ["C8H11N4O2"]
 
 
 class TestParseMassGymCeStr:

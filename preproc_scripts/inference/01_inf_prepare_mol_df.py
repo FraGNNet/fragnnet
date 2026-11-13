@@ -92,6 +92,14 @@ def create_mol_df(
         lambda x: len(set(list(formula_utils.parse_formula(x).keys())) - allowed_elements)
     )
 
+    # Count isotope-labelled atoms ([2H], [13C], [18F], ...). The formula/mass machinery
+    # is element-count based, so a labelled atom is scored against its natural-abundance
+    # mass: the predicted peaks would be systematically off by the label's mass defect.
+    mol_df.loc[:, "num_isotope_atoms"] = par_apply_series(
+        mol_df["mol"],
+        lambda m: sum(a.GetIsotope() != 0 for a in m.GetAtoms()) if m is not None else 0,
+    )
+
     # Filter out molecules based on quality criteria
     logger.info("Filtering molecules based on quality criteria...")
     initial_count_filter = len(mol_df)
@@ -103,6 +111,7 @@ def create_mol_df(
         & (mol_df["charge"] == 0)
         & (mol_df["num_heavy_atoms"] <= max_heavy_atoms)
         & (mol_df["num_out_set_elements"] == 0)
+        & (mol_df["num_isotope_atoms"] == 0)
     ]
 
     filtered_count = len(mol_df)
@@ -110,7 +119,7 @@ def create_mol_df(
         logger.warning(
             f"Filtered out {initial_count_filter - filtered_count} molecules due to quality criteria"
         )
-        logger.info("  - Kept only single molecules with no radicals and no charge")
+        logger.info("  - Kept only single molecules with no radicals, no charge, no isotope labels")
 
     # Reset mol_id after filtering
     mol_df = mol_df.reset_index(drop=True)

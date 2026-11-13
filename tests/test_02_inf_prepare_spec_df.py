@@ -219,3 +219,54 @@ class Test02InfPrepareSpecDf:
         # Empty inst_types should raise
         with pytest.raises(ValueError):
             spec_df_module.validate_inputs(["[M+H]+"], [], [], [])
+
+    @pytest.mark.parametrize(
+        ("prec_type", "expected"),
+        [
+            ("[M+H]+", "P"),
+            ("[M+Na]+", "P"),
+            ("[M+K]+", "P"),
+            ("[M+NH4]+", "P"),
+            ("[M]+", "P"),
+            ("[M+2H]2+", "P"),
+            ("EI", "P"),  # matches NIST_EI_ION_MODE in 01_prepare_df.py
+            ("[M-H]-", "N"),
+            ("[M+Cl]-", "N"),
+            ("[M+CH3COOH-H]-", "N"),
+            ("[M+HCOOH-H]-", "N"),
+            ("[M-2H]2-", "N"),
+        ],
+    )
+    def test_ion_mode_from_prec_type(self, prec_type, expected):
+        """ion_mode must follow the precursor charge, not a hardcoded default."""
+        spec_df_module = _load_script_module("02_inf_prepare_spec_df.py")
+
+        assert spec_df_module.ion_mode_from_prec_type(prec_type) == expected
+
+    def test_negative_adducts_get_negative_ion_mode(self, test_mol_df):
+        """Regression: [M-H]- rows used to be written with ion_mode 'P'.
+
+        Downstream ``filter_spec_mol(..., ion_modes=[...])`` selects on this column,
+        so a wrong value silently drops every negative-mode spectrum.
+        """
+        spec_df_module = _load_script_module("02_inf_prepare_spec_df.py")
+
+        config = spec_df_module.get_config(
+            prec_types=["[M+H]+", "[M-H]-"],
+            qtof_ces=[],
+            ft_ces=["25.0NCE"],
+            inst_types=["FT"],
+            output_dir="/tmp",
+            merged_spectra=False,
+        )
+        spec_df = spec_df_module.create_spec_df(test_mol_df, config)
+
+        observed = spec_df.groupby("prec_type")["ion_mode"].unique().apply(list).to_dict()
+        assert observed == {"[M+H]+": ["P"], "[M-H]-": ["N"]}
+
+    def test_unparseable_prec_type_raises(self):
+        """An adduct with no charge suffix should fail loudly, not default to 'P'."""
+        spec_df_module = _load_script_module("02_inf_prepare_spec_df.py")
+
+        with pytest.raises((ValueError, AssertionError)):
+            spec_df_module.ion_mode_from_prec_type("[M+H]")

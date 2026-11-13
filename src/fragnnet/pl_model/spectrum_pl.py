@@ -18,6 +18,7 @@ import torch as th
 from lightning.fabric.utilities.seed import _collect_rng_states, _set_rng_states
 from lightning.pytorch.loggers import WandbLogger
 
+from fragnnet.model.fragnnet_model import EXPLAINABILITY_OUTPUT_KEYS
 from fragnnet.model.loss import sparse_entropy_fn
 from fragnnet.utils.misc_utils import (
     TOLERANCE_MIN_MZ,
@@ -36,6 +37,7 @@ from fragnnet.utils.spec_utils import (
     batched_filter_func,
     batched_l1_normalize,
     batched_mf1000_normalize,
+    batched_rel_filter_func,
     calculate_match_mzs,
     cos_sim_helper,
     get_ints_transform_func,
@@ -220,6 +222,20 @@ class SpectrumPL(L.LightningModule):
         else:
             self.register_buffer("inst_tol_lookup", None, persistent=False)
             self.register_buffer("inst_min_mz_lookup", None, persistent=False)
+            # Without the lookup, `_common_step` skips these scores entirely, but they are
+            # still registered as metric names - so the exporters wrote a column of -1 for
+            # every spectrum and the run reported success. `inst_type_loss_tol` is null in
+            # config/template.yml while run_save_inference_eval.py requests
+            # cos_hun_inst_tol by default, so that combination is easy to hit by accident.
+            needs_inst_tol = {"cos_hun_inst_tol", "jss_hun_inst_tol"}.intersection(
+                self.hparams["auxiliary_scores"]
+            )
+            if needs_inst_tol:
+                raise ValueError(
+                    f"auxiliary_scores {sorted(needs_inst_tol)} need per-instrument match "
+                    "tolerances, but inst_type_loss_tol is unset. Configure it (see "
+                    "config/template.yml) or remove those scores from auxiliary_scores."
+                )
 
         # idx↔str maps are fetched lazily from the dataloader dataset via
         # _get_dataset_maps() — the dataset is the canonical source of truth.
@@ -235,12 +251,17 @@ class SpectrumPL(L.LightningModule):
         Setup spectrum preprocessing functions: filtering, binning, intensity transforms, and normalization.
         """
 
-        def _filter_func(mzs, ints, batch_idxs):
-            return batched_filter_func(
-                mzs, ints, batch_idxs, self.hparams["target_ints_thresh"], self.hparams.mz_max
+        def _rel_filter_func(mzs, ints, batch_idxs, batch_size=None):
+            return batched_rel_filter_func(
+                mzs,
+                ints,
+                batch_idxs,
+                rel_thresh=self.hparams["target_rel_ints_thresh"],
+                mz_max=self.hparams["mz_max"],
+                dim_size=batch_size,
             )
 
-        self.filter_func = _filter_func
+        self.rel_filter_func = _rel_filter_func
 
         def _target_rank_filter_func(mzs, ints, batch_idxs):
             return batched_filter_func(
@@ -501,6 +522,12 @@ class SpectrumPL(L.LightningModule):
                 raise ValueError(f"metric_name {metric_name} not recognized")
 
         self.metric_names.update(self.auxiliary_metric_names)
+        # Metric inputs that only exist on an explainability forward. Metrics reach
+        # `metric_fn` only through `extra_metric_args`, so this intersection is the complete
+        # set of metric inputs a `return_explainability_tensors=False` forward would hand
+        # back as None (e.g. `pred_nb_node_batch_idxs`, which `pred_node_count` needs under
+        # nb_iso). `inference_step` ORs its own demand on when this is non-empty.
+        self.expl_metric_args = EXPLAINABILITY_OUTPUT_KEYS.intersection(self.extra_metric_args)
 
         def calculate_all_auxiliary_metrics(
             true_mzs,
@@ -521,13 +548,11 @@ class SpectrumPL(L.LightningModule):
                 th.max(pred_batch_idxs) + 1,
             )
 
-            if split == "train" or split == "val":
-                metric_d = {
-                    k: -th.ones([batch_size], dtype=true_ints.dtype, device=true_ints.device)
-                    for k in self.auxiliary_metric_names
-                }
-            else:
-                metric_d = {}
+            # Per-spectrum metrics assign by batch index in test/predict as well.
+            metric_d = {
+                k: -th.ones([batch_size], dtype=true_ints.dtype, device=true_ints.device)
+                for k in self.auxiliary_metric_names
+            }
             # define aggregation
             agg = "sum" if self.hparams.sum_ints else "amax"
 
@@ -1080,11 +1105,12 @@ class SpectrumPL(L.LightningModule):
         spec_mzs,
         spec_ints,
         spec_batch_idxs,
-        filter_spec=False,
+        rel_filter_spec=False,
         target_rank_filter_spec=False,
         bin_spec=False,
         transform_spec=False,
         normalize_spec=False,
+        batch_size=None,
     ):
         """
         Preprocess a spectrum: filter, bin, transform, and normalize intensities as needed.
@@ -1092,10 +1118,9 @@ class SpectrumPL(L.LightningModule):
         # assumes spec_ints are not logged, or transformed in any way
         # does not assume any particular kind of normalization
 
-        if filter_spec:
-            # filter
-            spec_mzs, spec_ints, spec_batch_idxs = self.filter_func(
-                spec_mzs, spec_ints, spec_batch_idxs
+        if rel_filter_spec:
+            spec_mzs, spec_ints, spec_batch_idxs = self.rel_filter_func(
+                spec_mzs, spec_ints, spec_batch_idxs, batch_size=batch_size
             )
         if target_rank_filter_spec:
             spec_mzs, spec_ints, spec_batch_idxs = self.target_rank_filter_func(
@@ -1125,6 +1150,7 @@ class SpectrumPL(L.LightningModule):
         pred: bool,
         log_in: bool = False,
         log_out: bool = False,
+        batch_size: int | None = None,
     ):
         """
         Convenience wrapper for spectrum preprocessing, handling different modes for train/pred.
@@ -1137,21 +1163,22 @@ class SpectrumPL(L.LightningModule):
                 spec_mzs,
                 spec_ints,
                 spec_batch_idxs,
-                filter_spec=False,
                 bin_spec=self.binned_loss,
                 transform_spec=False,
                 normalize_spec=False,
+                batch_size=batch_size,
             )
         elif train and (not pred):
             spec_mzs, spec_ints, spec_batch_idxs = self._preproc_spec(
                 spec_mzs,
                 spec_ints,
                 spec_batch_idxs,
-                filter_spec=True,
+                rel_filter_spec=True,
                 target_rank_filter_spec=True,
                 bin_spec=self.binned_loss,
                 transform_spec=True,
                 normalize_spec=True,
+                batch_size=batch_size,
             )
         elif (not train) and pred:
             # untransform
@@ -1163,7 +1190,7 @@ class SpectrumPL(L.LightningModule):
                 spec_mzs,
                 spec_ints,
                 spec_batch_idxs,
-                filter_spec=True,
+                rel_filter_spec=True,
                 target_rank_filter_spec=self.hparams.get(
                     "eval_target_apply_train_rank_filters",
                     self.hparams.get("eval_target_apply_train_peak_filters", False),
@@ -1171,6 +1198,7 @@ class SpectrumPL(L.LightningModule):
                 bin_spec=False,
                 transform_spec=False,
                 normalize_spec=True,
+                batch_size=batch_size,
             )
         if log_out:
             spec_ints = safelog(spec_ints, eps=self.hparams.log_min)
@@ -1179,6 +1207,9 @@ class SpectrumPL(L.LightningModule):
     def predict_step(self, **batch_kwargs):
         """
         PyTorch Lightning predict_step override.
+
+        Pure prediction: no loss, no metrics. The caller declares what it needs via
+        `return_explainability_tensors` in the batch, which rides straight through.
         """
         return self.forward(**batch_kwargs)
 
@@ -1215,7 +1246,14 @@ class SpectrumPL(L.LightningModule):
         group_per_mol = batch["group_per_mol"]
         # prepare ground truth
         train_true_mzs, train_true_logprobs, train_true_batch_idxs = self.preproc_spec(
-            true_mzs, true_ints, true_batch_idxs, train=True, pred=False, log_in=False, log_out=True
+            true_mzs,
+            true_ints,
+            true_batch_idxs,
+            train=True,
+            pred=False,
+            log_in=False,
+            log_out=True,
+            batch_size=batch_size,
         )
         # forward pass and get predictions
         pred_d = self.forward(**batch)
@@ -1302,6 +1340,7 @@ class SpectrumPL(L.LightningModule):
                     pred=False,
                     log_in=False,
                     log_out=False,
+                    batch_size=batch_size,
                 )
                 eval_true_logprobs = safelog(eval_true_probs, eps=self.hparams.log_min)
                 eval_pred_mzs, eval_pred_probs, eval_pred_batch_idxs = self.preproc_spec(
@@ -1431,33 +1470,52 @@ class SpectrumPL(L.LightningModule):
         self._update_results(batch_results, "test")
         return mean_loss
 
-    def inference_with_ground_truth_step(self, batch, split="test"):
-        """Run inference and compute evaluation metrics against ground truth without loss.
+    def inference_step(self, batch, *, metrics: str | None = None):
+        """Run inference outside Lightning's test/val loop, optionally scoring it.
 
-        Performs a forward pass and computes auxiliary metrics (e.g. cos_sim, cos_hun)
-        against the ground-truth spectrum. Loss functions are never called, making this
-        cheaper than ``_common_step`` for pure inference evaluation.
+        Runs a forward pass and pushes the predicted spectrum through
+        ``preproc_spec(train=False, pred=True)``, which applies ``ints_untransform_func``
+        and then L1-normalizes. The postcondition is the same in both modes: ``pred_ints``
+        is linear and sums to 1 per spectrum, so no consumer has to ask which path ran.
+
+        When ``metrics`` is set the ground-truth spectrum is preprocessed the same way and
+        the auxiliary metrics (e.g. ``cos_sim``, ``cos_hun``) are computed against it. Loss
+        functions are never called in either mode, which is what makes this cheaper than
+        ``_common_step``. Assumes the model is in eval mode but does not switch modes.
 
         Args:
-            batch: Input batch dict containing ground-truth spectrum fields
-                (``spec_mzs``, ``spec_ints``, ``spec_batch_idxs``, etc.).
-            split: Metric split name used to select which auxiliary metrics to compute.
+            batch: Input batch dict. Ground-truth spectrum fields (``spec_mzs``,
+                ``spec_ints``, ``spec_batch_idxs``, ``spec_prec_mz``) are read only when
+                ``metrics`` is set, so a prediction-only batch need not carry them.
+            metrics: Metric split name (e.g. ``"test"``) selecting which auxiliary metrics
+                to compute against ground truth, or None to skip ground truth entirely.
 
         Returns:
-            Dict with predicted spectrum tensors (``pred_mzs``, ``pred_logprobs``,
-            ``pred_batch_idxs``), ``oos_prob`` if available, and all auxiliary metric
-            values (e.g. ``cos_sim``, ``cos_hun``).
+            Dict with ``pred_mzs``, ``pred_ints`` (linear, L1-normalized per spectrum),
+            ``pred_batch_idxs``, ``pred_oos_logprobs``, and every other forward output.
+            When ``metrics`` is set, additionally ``true_mzs``/``true_logprobs``/
+            ``true_batch_idxs``/``true_prec_mzs``, ``oos_prob``, the auxiliary metric
+            values, and ``pred_logprobs`` (see Note).
+
+        Note:
+            ``pred_logprobs`` is emitted in metrics mode only, as ``log(pred_ints)``, to
+            keep saved ``vals.pkl`` artifacts readable by
+            ``scripts/stats_scripts/calculate_ensemble_agreement_stats.py``, which
+            ensembles it in log space. It is a compatibility key: ``pred_ints`` is the
+            only intensity contract, and nothing in the live code path reads
+            ``pred_logprobs`` to obtain intensities.
         """
         if self.training:
             warnings.warn("Model is in training mode")
 
-        true_mzs = batch["spec_mzs"]
-        true_ints = batch["spec_ints"]
-        true_batch_idxs = batch["spec_batch_idxs"]
-        true_prec_mzs = batch["spec_prec_mz"]
-        spec_per_group = batch["spec_per_group"]
-        spec_per_mol = batch["spec_per_mol"]
-        group_per_mol = batch["group_per_mol"]
+        # Auxiliary metrics can need a marginal the caller did not ask to export, so this
+        # step ORs its own demand onto whatever the caller declared.
+        if (
+            metrics is not None
+            and self.expl_metric_args
+            and not batch.get("return_explainability_tensors", True)
+        ):
+            batch = {**batch, "return_explainability_tensors": True}
 
         pred_d = self.forward(**batch)
         pred_mzs = pred_d.pop("pred_mzs")
@@ -1466,17 +1524,7 @@ class SpectrumPL(L.LightningModule):
         pred_oos_logprobs = pred_d.pop("pred_oos_logprobs", None)
 
         with th.inference_mode():
-            eval_true_mzs, eval_true_probs, eval_true_batch_idxs = self.preproc_spec(
-                true_mzs,
-                true_ints,
-                true_batch_idxs,
-                train=False,
-                pred=False,
-                log_in=False,
-                log_out=False,
-            )
-            eval_true_logprobs = safelog(eval_true_probs, eps=self.hparams.log_min)
-            eval_pred_mzs, eval_pred_probs, eval_pred_batch_idxs = self.preproc_spec(
+            eval_pred_mzs, eval_pred_ints, eval_pred_batch_idxs = self.preproc_spec(
                 pred_mzs.detach(),
                 pred_logprobs.detach(),
                 pred_batch_idxs.detach(),
@@ -1485,27 +1533,54 @@ class SpectrumPL(L.LightningModule):
                 log_in=True,
                 log_out=False,
             )
-            eval_pred_logprobs = safelog(eval_pred_probs, eps=self.hparams.log_min)
 
         results = {
-            "unique_id": batch["spec_unique_id"],
-            "smiles": batch["mol_smiles"],
-            "spec_per_group": spec_per_group,
-            "spec_per_mol": spec_per_mol,
-            "group_per_mol": group_per_mol,
-            "true_mzs": eval_true_mzs,
-            "true_logprobs": eval_true_logprobs,
-            "true_batch_idxs": eval_true_batch_idxs,
-            "true_prec_mzs": true_prec_mzs,
             "pred_mzs": eval_pred_mzs,
-            "pred_logprobs": eval_pred_logprobs,
+            "pred_ints": eval_pred_ints,
             "pred_batch_idxs": eval_pred_batch_idxs,
+            "pred_oos_logprobs": pred_oos_logprobs,
             **pred_d,
         }
+        # P(out of spectrum) is a forward output and needs no ground truth. This exp() used
+        # to sit below the early return, on the metrics side, so a prediction-only run could
+        # never export `pred_oos_prob` - `--output_everything` emitted it as NaN.
         if pred_oos_logprobs is not None:
             results["oos_prob"] = th.exp(pred_oos_logprobs)
+        if metrics is None:
+            return results
 
-        active_metric_names = self._get_active_metric_names(split)
+        batch_size = batch["batch_size"]
+        true_prec_mzs = batch["spec_prec_mz"]
+        with th.inference_mode():
+            eval_true_mzs, eval_true_probs, eval_true_batch_idxs = self.preproc_spec(
+                batch["spec_mzs"],
+                batch["spec_ints"],
+                batch["spec_batch_idxs"],
+                train=False,
+                pred=False,
+                log_in=False,
+                log_out=False,
+                batch_size=batch_size,
+            )
+            eval_true_logprobs = safelog(eval_true_probs, eps=self.hparams.log_min)
+            eval_pred_logprobs = safelog(eval_pred_ints, eps=self.hparams.log_min)
+
+        results.update(
+            {
+                "unique_id": batch["spec_unique_id"],
+                "smiles": batch["mol_smiles"],
+                "spec_per_group": batch["spec_per_group"],
+                "spec_per_mol": batch["spec_per_mol"],
+                "group_per_mol": batch["group_per_mol"],
+                "true_mzs": eval_true_mzs,
+                "true_logprobs": eval_true_logprobs,
+                "true_batch_idxs": eval_true_batch_idxs,
+                "true_prec_mzs": true_prec_mzs,
+                "pred_logprobs": eval_pred_logprobs,
+            }
+        )
+
+        active_metric_names = self._get_active_metric_names(metrics)
         need_aux_metrics = len(active_metric_names.intersection(self.auxiliary_metric_names)) > 0
         if need_aux_metrics:
             with th.inference_mode():
@@ -1515,11 +1590,11 @@ class SpectrumPL(L.LightningModule):
                     "true_logprobs": eval_true_logprobs,
                     "true_batch_idxs": eval_true_batch_idxs,
                     "pred_mzs": eval_pred_mzs,
-                    "pred_ints": eval_pred_probs,
+                    "pred_ints": eval_pred_ints,
                     "pred_logprobs": eval_pred_logprobs,
                     "pred_batch_idxs": eval_pred_batch_idxs,
                     "true_prec_mzs": true_prec_mzs,
-                    "split": split,
+                    "split": metrics,
                 }
                 for arg in self.extra_metric_args:
                     metric_input_d[arg] = results[arg]
@@ -1530,41 +1605,6 @@ class SpectrumPL(L.LightningModule):
             for k, v in metric_output_d.items():
                 results[k] = v
 
-        return results
-
-    def inference_step(self, batch):
-        """
-        Custom inference step for evaluation outside of Lightning's test/val loop.
-        This will assume that the model is in eval mode, but will not switch modes.
-        """
-        if self.training:
-            warnings.warn("Model is in training mode")
-
-        # forward pass and get predictions
-        pred_d = self.forward(**batch)
-        pred_mzs = pred_d.pop("pred_mzs")
-        pred_logprobs = pred_d.pop("pred_logprobs")
-        pred_batch_idxs = pred_d.pop("pred_batch_idxs")
-        pred_oos_logprobs = pred_d.pop("pred_oos_logprobs", None)
-        eval_pred_mzs, eval_pred_probs, eval_pred_batch_idxs = self.preproc_spec(
-            pred_mzs,
-            pred_logprobs,
-            pred_batch_idxs,
-            train=False,
-            pred=True,
-            log_in=True,
-            log_out=False,
-        )
-
-        results = {
-            "pred_mzs": eval_pred_mzs,
-            "pred_ints": eval_pred_probs,
-            "pred_batch_idxs": eval_pred_batch_idxs,
-            "pred_oos_logprobs": pred_oos_logprobs,
-        }
-        # get rest of pred_d
-        for k, v in pred_d.items():
-            results[k] = v
         return results
 
     def configure_optimizers(self):

@@ -194,9 +194,7 @@ def filter_spec_mol(
     # fragment formulas, producing wrong m/z values.
     charged_mol_ids = set(mol_df[mol_df["charge"] == 1]["mol_id"].tolist())
     if charged_mol_ids:
-        bad_adduct_mask = spec_df["mol_id"].isin(charged_mol_ids) & (
-            spec_df["prec_type"] != "[M]+"
-        )
+        bad_adduct_mask = spec_df["mol_id"].isin(charged_mol_ids) & (spec_df["prec_type"] != "[M]+")
         n_bad = int(bad_adduct_mask.sum())
         if n_bad > 0:
             print(
@@ -254,9 +252,9 @@ def filter_spec_mol(
 
 def merge_spec_df(spec_df, renormalize=False, sum_ints=True, keep_ces=False):
     # merge the peaks (they are not normalized here)
-    m_peaks_func = lambda peakses: merge_sparse_specs(
-        *peakses, renormalize=renormalize, sum_ints=sum_ints
-    )
+    def m_peaks_func(peakses):
+        return merge_sparse_specs(*peakses, renormalize=renormalize, sum_ints=sum_ints)
+
     m_spec_peaks_df = (
         spec_df[["group_id", "peaks"]]
         .groupby("group_id")
@@ -266,10 +264,24 @@ def merge_spec_df(spec_df, renormalize=False, sum_ints=True, keep_ces=False):
     m_spec_meta_df = spec_df.drop(columns=["peaks", "spec_id"]).drop_duplicates(subset=["group_id"])
     m_spec_df = m_spec_peaks_df.merge(m_spec_meta_df, on=["group_id"], how="inner")
     if keep_ces:
+        # Flatten to 1-D so th.tensor() can create a uniform 1-D tensor per spectrum.
+        # An nce/ace cell is a list once _fill_ce_list (base_dataset Phase 2) has run,
+        # and plain `list` aggregation would then give a list-of-lists. But Phase 2 only
+        # runs when spec_params nce/ace is set, so with merge_keep_ces=True and both off
+        # the cells are still scalars -- take those as single values rather than raising.
+        def _flatten(x):
+            flat = []
+            for v in x:
+                if isinstance(v, (list, tuple, np.ndarray)):
+                    flat.extend(v)
+                else:
+                    flat.append(v)
+            return flat
+
         m_spec_ce_df = (
             spec_df[["group_id", "nce", "ace"]]
             .groupby("group_id")
-            .agg({"nce": list, "ace": list})
+            .agg({"nce": _flatten, "ace": _flatten})
             .reset_index()
         )
         m_spec_df = m_spec_df.drop(columns=["nce", "ace"])

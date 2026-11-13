@@ -17,6 +17,28 @@ from tqdm import tqdm
 from fragnnet.utils.formula_utils import ELECTRON_MASS, MASS, NEUTRON_MASS
 from fragnnet.utils.misc_utils import none_or_nan, np_temp_seed
 
+VALID_ELEMENTS = (
+    "C",
+    "N",
+    "P",
+    "O",
+    "S",
+    "Si",
+    "I",
+    "H",
+    "Cl",
+    "F",
+    "Br",
+    "B",
+    "Se",
+    "Fe",
+    "Co",
+    "As",
+    "Na",
+    "K",
+)
+ELEMENT_TO_MASS = {element: MASS(element) for element in VALID_ELEMENTS}
+
 # don't do expesive import in runtime
 if TYPE_CHECKING:
     pass
@@ -598,7 +620,14 @@ def seq_apply(iterator, func, need_unpack=False):
     return result
 
 
-def par_apply(iterator, func, need_unpack=False, return_as_generator=False, n_jobs=JOBLIB_N_JOBS):
+def par_apply(
+    iterator,
+    func,
+    need_unpack=False,
+    return_as_generator=False,
+    n_jobs=JOBLIB_N_JOBS,
+    unordered=False,
+):
     """Apply a function to each item in an iterator in parallel.
 
     Args:
@@ -607,17 +636,41 @@ def par_apply(iterator, func, need_unpack=False, return_as_generator=False, n_jo
             need_unpack (bool, optional): _description_. Defaults to False.
             return_as_generator (bool, optional): _description_. Defaults to False.
             n_jobs (_type_, optional): _description_. Defaults to JOBLIB_N_JOBS.
+            unordered (bool, optional): Yield generator results as workers finish.
+                Requires ``return_as_generator=True``. Defaults to False.
 
     Returns:
             _type_: _description_
     """
+    if unordered and not return_as_generator:
+        raise ValueError("unordered=True requires return_as_generator=True")
+
     par_func = joblib.delayed(func)
-    parallel = joblib.Parallel(
-        backend=JOBLIB_BACKEND,
-        n_jobs=n_jobs,
-        timeout=JOBLIB_TIMEOUT,
-        return_as="list" if not return_as_generator else "generator",
-    )
+    if unordered:
+        return_as = "generator_unordered"
+    elif return_as_generator:
+        return_as = "generator"
+    else:
+        return_as = "list"
+    parallel_kwargs = {
+        "backend": JOBLIB_BACKEND,
+        "n_jobs": n_jobs,
+        "timeout": JOBLIB_TIMEOUT,
+        "return_as": return_as,
+    }
+    try:
+        parallel = joblib.Parallel(**parallel_kwargs)
+    except ValueError:
+        if not unordered:
+            raise
+        warnings.warn(
+            "Installed joblib/backend does not support unordered generators; falling back "
+            "to ordered generator results.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        parallel_kwargs["return_as"] = "generator"
+        parallel = joblib.Parallel(**parallel_kwargs)
     if not need_unpack:
         result = parallel(par_func(i) for i in iterator)
     else:
@@ -977,16 +1030,23 @@ def composition_to_string(x):
 
 
 def combine_formulae(formula_1, formula_2):
-    if isinstance(formula_1, str):
-        formula_1 = Composition(formula_1)
-    if isinstance(formula_2, str):
-        formula_2 = Composition(formula_2)
-    combine_comp = Composition(formula_1) + Composition(formula_2)
+    # `formula=` is required: pyteomics reads a positional string as a PEPTIDE SEQUENCE, so
+    # Composition("C") is cysteine, not carbon. Any digit-free formula in the one-letter amino
+    # acid alphabet (C, N, O, CO, CN, CNO, ...) silently misparsed before this was keyword-ed.
+    # Each operand is normalised exactly once; the previous `Composition(formula_1) +
+    # Composition(formula_2)` re-copied both on every call, once per predicted fragment.
+    formula_1 = (
+        Composition(formula=formula_1) if isinstance(formula_1, str) else Composition(formula_1)
+    )
+    formula_2 = (
+        Composition(formula=formula_2) if isinstance(formula_2, str) else Composition(formula_2)
+    )
+    combine_comp = formula_1 + formula_2
     return composition_to_string(combine_comp)
 
 
 def parse_product_isotope(annot, precursor):
-    formula = Composition("")
+    formula = Composition(formula="")
     precursor = Composition(formula=precursor)
     adducts = []
     losses = []
@@ -1055,7 +1115,10 @@ def parse_annotations(row):
     if error is not None:
         error = repr(error)
         return np.nan, np.nan, np.nan, np.nan, np.nan, error
-    precursor = Composition(formula)
+    # `formula=` for the same reason as in `combine_formulae`: this is a molecular formula
+    # in Hill notation, which drops the "1" on count-one elements, so an all-single-atom
+    # formula like "CHN" or "CO" is a valid peptide sequence and parses as one positionally.
+    precursor = Composition(formula=formula)
     if prec_type == "[M+H]+":
         precursor["H"] += 1
     elif prec_type == "[M-H]-":

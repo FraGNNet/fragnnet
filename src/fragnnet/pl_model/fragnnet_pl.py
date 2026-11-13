@@ -15,6 +15,7 @@ import os
 
 from fragnnet.model import FraGNNetModel
 from fragnnet.model.loss import (
+    get_cross_jss_contrastive,
     get_edge_loss_fn,
     get_pairwise_cossim,
     get_pairwise_cross_entropy,
@@ -108,6 +109,9 @@ class FraGNNetPL(SpectrumPL):
             frag_mode_scale=self.hparams.frag_mode_scale,
             ce_scale=self.hparams.ce_scale,
             ce_scaler_hidden_dim=self.hparams.ce_scaler_hidden_dim,
+            adduct_scale=self.hparams.adduct_scale,
+            stratum_scale=self.hparams.stratum_scale,
+            stratum_scaler_embed_dim=self.hparams.stratum_scaler_embed_dim,
             output_formula_str=self.hparams.output_formula_str,
             cc_feature_dropout=self.hparams.cc_feature_dropout,
             debug_validate_outputs=self.hparams.debug_validate_outputs,
@@ -166,7 +170,7 @@ class FraGNNetPL(SpectrumPL):
 
         Args:
             ckpt_path: Path to checkpoint file
-            strict: Whether to enforce strict state dict matching
+            strict: Require complete, shape-compatible state for the selected components.
             shared_components: List of component prefixes to load (if None, load all matching)
         """
         if not os.path.exists(ckpt_path):
@@ -186,20 +190,28 @@ class FraGNNetPL(SpectrumPL):
             target_components = None
 
         # 2. Check if shared_components are in the target and source
-        target_keys = set(self.model.state_dict().keys())
+        target_state = self.model.state_dict()
+        target_keys = set(target_state)
 
         # Normalize source keys (remove 'model.' prefix if present)
         source_keys = list(state_dict.keys())
         source_starts_with_model = any(k.startswith("model.") for k in source_keys)
         normalized_source_dict = {}
         for k, v in state_dict.items():
+            if source_starts_with_model and not k.startswith("model."):
+                continue  # Lightning state outside the transferred model.
             norm_k = k[6:] if (source_starts_with_model and k.startswith("model.")) else k
             normalized_source_dict[norm_k] = v
 
         if target_components:
             for comp in target_components:
                 # Check target
-                if not any(k.startswith(comp) for k in target_keys):
+                if (
+                    not any(k.startswith(comp) for k in target_keys)
+                    and comp not in dict(self.model.named_modules())
+                ):
+                    if strict:
+                        raise RuntimeError(f"Component '{comp}' not found in current model.")
                     logging.warning(f"Component '{comp}' not found in current model (target).")
                 # Check source
                 if not any(k.startswith(comp) for k in normalized_source_dict):
@@ -209,35 +221,48 @@ class FraGNNetPL(SpectrumPL):
                 "No specific shared_components provided; attempting to load all compatible weights."
             )
 
-        # 3. Load model weight into target components
-        weights_to_load = {}
-        for key in target_keys:
-            # Filter by component
-            if target_components is not None:
-                if not any(key.startswith(comp) for comp in target_components):
-                    continue
+        # 3. Validate all selected tensors before changing any model weights.
+        selected_target_keys = {
+            k for k in target_keys
+            if target_components is None or any(k.startswith(c) for c in target_components)
+        }
+        selected_source_keys = {
+            k for k in normalized_source_dict
+            if target_components is None or any(k.startswith(c) for c in target_components)
+        }
+        if strict:
+            missing = sorted(selected_target_keys - selected_source_keys)
+            unexpected = sorted(selected_source_keys - selected_target_keys)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"Checkpoint keys do not match selected components: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
 
-            # Check if key exists in source
-            if key in normalized_source_dict:
-                weights_to_load[key] = normalized_source_dict[key]
+        weights_to_load = {}
+        for key in sorted(selected_target_keys & selected_source_keys):
+            source = normalized_source_dict[key]
+            if source.shape != target_state[key].shape:
+                message = (
+                    f"Checkpoint shape mismatch for {key}: "
+                    f"{tuple(source.shape)} vs {tuple(target_state[key].shape)}"
+                )
+                if strict:
+                    raise RuntimeError(message)
+                logging.warning(message)
+                continue
+            weights_to_load[key] = source
 
         if not weights_to_load:
             logging.warning("No compatible weights found to transfer")
             return
 
-        # Load into self.model
-        try:
-            self.model.load_state_dict(weights_to_load, strict=False)
-            logging.info(f"Successfully loaded {len(weights_to_load)} parameters.")
-
-            # 4. Update dictionary for tracking
-            self.pretrained_param_names = list(weights_to_load.keys())
-
-        except RuntimeError as e:
-            if strict:
-                raise e
-            else:
-                logging.warning(f"Load failed with error: {e}")
+        # 4. Copy validated weights and track only the tensors actually loaded.
+        self.model.load_state_dict(
+            weights_to_load, strict=strict and target_components is None
+        )
+        logging.info(f"Successfully loaded {len(weights_to_load)} parameters.")
+        self.pretrained_param_names = list(weights_to_load.keys())
 
     def _freeze_components(self, components: list[str], exact_match: bool = False):
         """
@@ -367,6 +392,10 @@ class FraGNNetPL(SpectrumPL):
         _add_if_active(
             [f"pairwise_cross_entropy_{self.hparams.mz_bin_res}"],
             self.hparams.pairwise_cross_entropy_loss_weight,
+        )
+        _add_if_active(
+            [f"cross_jss_contrastive_{self.hparams.mz_bin_res}"],
+            self.hparams.cross_jss_contrastive_loss_weight,
         )
 
         self.loss_names = loss_names
@@ -1025,6 +1054,26 @@ class FraGNNetPL(SpectrumPL):
                         [batch_size], device=pairwise_ce_mse.device, dtype=pairwise_ce_mse.dtype
                     )
                 )
+            # Cross-matrix JSS contrastive loss
+            if f"cross_jss_contrastive_{self.hparams.mz_bin_res}" in self.loss_names:
+                batch_size = kwargs.get("batch_size", th.max(true_batch_idxs) + 1)
+                cross_jss_loss = get_cross_jss_contrastive(
+                    true_mzs,
+                    true_logprobs,
+                    true_batch_idxs,
+                    pred_mzs,
+                    pred_logprobs,
+                    pred_batch_idxs,
+                    batch_size=batch_size,
+                    mz_max=self.hparams.mz_max,
+                    mz_bin_res=self.hparams.mz_bin_res,
+                    temperature=self.hparams.cross_jss_contrastive_temperature,
+                    sqrt_transform=self.hparams.cross_jss_contrastive_sqrt,
+                    chunk_size=self.hparams.loss_batch_size,
+                )
+                loss = loss + self.hparams.cross_jss_contrastive_loss_weight * cross_jss_loss
+                loss_d[f"cross_jss_contrastive_{self.hparams.mz_bin_res}"] = cross_jss_loss
+
             # finally, update the loss
             loss_d["loss"] = loss
 
@@ -1113,7 +1162,7 @@ class FraGNNetPL(SpectrumPL):
                     "mean_loss does not require grad (detached). "
                     f"total_loss.requires_grad={getattr(total_loss, 'requires_grad', None)}"
                 )
-            if not th.isfinite(mean_loss):
+            if batch_idx % 100 == 0 and not th.isfinite(mean_loss):
                 raise RuntimeError(
                     f"Non-finite mean_loss detected: {mean_loss.detach().float().cpu().item()} "
                     f"(batch_idx={batch_idx}, batch_size={batch_size}, total_weight={float(total_weight) if not isinstance(total_weight, th.Tensor) else total_weight.detach().float().cpu().item()})"

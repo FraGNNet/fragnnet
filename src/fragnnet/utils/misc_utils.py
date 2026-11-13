@@ -7,6 +7,7 @@ and torch/pandas friendly for use in data loading, model code, and scripts.
 """
 
 import glob
+import logging
 import multiprocessing
 import os
 import shutil
@@ -552,7 +553,13 @@ def scatter_reduce(
     default: float = 0.0,
     include_self: bool = True,
 ) -> th.Tensor:
-    """Thin wrapper over torch.scatter_reduce_ with validation."""
+    """Thin wrapper over torch.scatter_reduce_ with validation.
+
+    Pass `dim_size` whenever it is already known on the host (e.g. the batch size):
+    leaving it `None` forces a blocking `int(th.max(index))` host sync to derive it.
+    With `dim_size` given, bounds are checked with a non-blocking `torch._assert_async`
+    on CUDA tensors instead, so no sync is introduced.
+    """
 
     if reduce == "mean" and include_self:
         print("scatter_reduce: mean reduce with include_self=True is not recommended")
@@ -562,15 +569,24 @@ def scatter_reduce(
             dim_size = 0
         result_shape = src.shape[:dim] + (dim_size,) + src.shape[dim + 1 :]
         return th.full(result_shape, default, dtype=src.dtype, device=src.device)
-    max_index = int(th.max(index))
-    if max_index < 0:
-        raise ValueError("scatter_reduce: index contains negative entries")
     if dim_size is None:
+        max_index = int(th.max(index))
+        if max_index < 0:
+            raise ValueError("scatter_reduce: index contains negative entries")
         dim_size = max_index + 1
-    elif dim_size <= max_index:
-        raise ValueError(
-            f"scatter_reduce: dim_size {dim_size} is too small for max index {max_index}"
+    elif index.device.type == "cuda":
+        th._assert_async(
+            ((index >= 0) & (index < dim_size)).all(),
+            "scatter_reduce: index contains a negative entry or exceeds dim_size",
         )
+    else:
+        max_index = int(th.max(index))
+        if max_index < 0:
+            raise ValueError("scatter_reduce: index contains negative entries")
+        if dim_size <= max_index:
+            raise ValueError(
+                f"scatter_reduce: dim_size {dim_size} is too small for max index {max_index}"
+            )
     result_shape = src.shape[:dim] + (dim_size,) + src.shape[dim + 1 :]
     results = th.full(result_shape, default, dtype=src.dtype, device=src.device)
     results.scatter_reduce_(dim=dim, index=index, src=src, reduce=reduce, include_self=include_self)
@@ -990,3 +1006,100 @@ def progress_wrapper(
 
         for item in tqdm(iterable, total=total, desc=desc):
             yield item
+
+
+class ProgressLogger:
+    """Interval-based progress logger with rate, ETA, and error tracking.
+
+    A line is emitted every ``log_every`` items OR every ``log_seconds`` seconds,
+    whichever comes first, so long-running jobs stay legible in SLURM logs without
+    depending on tqdm. ``total=None`` marks an unknown denominator (a streaming
+    source), in which case the percentage and ETA are omitted.
+
+    Example:
+        progress = ProgressLogger(total=len(rows), desc="Fragment generation")
+        for row in rows:
+            ...
+            progress.update(is_error=failed)
+        progress.finish()
+    """
+
+    def __init__(
+        self,
+        total: int | None,
+        desc: str = "Progress",
+        log_every: int = 100,
+        log_seconds: float = 30.0,
+        logger: "logging.Logger | None" = None,
+    ) -> None:
+        self.total = total
+        self.desc = desc
+        self.log_every = max(1, log_every)
+        self.log_seconds = log_seconds
+        self.logger = logger if logger is not None else logging.getLogger(__name__)
+        self.n_done = 0
+        self.n_errors = 0
+        self.start_time = time.time()
+        self._last_log_time = self.start_time
+
+    @property
+    def elapsed(self) -> float:
+        """Seconds since the logger was created."""
+        return time.time() - self.start_time
+
+    @property
+    def rate(self) -> float:
+        """Completed items per second, 0.0 before any time has passed."""
+        elapsed = self.elapsed
+        return self.n_done / elapsed if elapsed > 0 else 0.0
+
+    def update(self, is_error: bool = False, n: int = 1) -> None:
+        """Record ``n`` completed items and log if an interval boundary was crossed."""
+        self.n_done += n
+        if is_error:
+            self.n_errors += n
+
+        now = time.time()
+        if self.n_done % self.log_every == 0 or (now - self._last_log_time) >= self.log_seconds:
+            self._log_progress(now)
+
+    def _log_progress(self, now: float) -> None:
+        elapsed = now - self.start_time
+        rate = self.n_done / elapsed if elapsed > 0 else 0.0
+        if self.total is None:
+            # Streaming source (e.g. an IterableDataset): the denominator is unknown
+            # until the stream is exhausted, so no percentage or ETA is reported.
+            self.logger.info(f"{self.desc}: {self.n_done}/?")
+            self.logger.info(f"  Rate: {rate:.2f} items/sec")
+            self.logger.info(f"  Elapsed: {elapsed:.0f}s")
+            if self.n_errors > 0:
+                self.logger.warning(f"  Errors encountered: {self.n_errors}")
+            self._last_log_time = now
+            return
+        remaining = max(0, self.total - self.n_done)
+        eta = remaining / rate if rate > 0 else 0.0
+        pct = (self.n_done / self.total * 100) if self.total > 0 else 0.0
+
+        self.logger.info(f"{self.desc}: {self.n_done}/{self.total} ({pct:.1f}%)")
+        self.logger.info(f"  Rate: {rate:.2f} items/sec")
+        self.logger.info(f"  Elapsed: {elapsed:.0f}s, ETA: {eta:.0f}s")
+        if self.n_errors > 0:
+            self.logger.warning(f"  Errors encountered: {self.n_errors}")
+        self._last_log_time = now
+
+    def finish(self) -> None:
+        """Log the completion summary: totals, wall time, average rate, success rate."""
+        elapsed = self.elapsed
+        avg_rate = self.n_done / elapsed if elapsed > 0 else 0.0
+
+        self.logger.info(f"{self.desc} completed")
+        self.logger.info(f"Total items processed: {self.n_done}")
+        self.logger.info(f"Total time elapsed: {elapsed:.2f} seconds")
+        self.logger.info(f"Average processing rate: {avg_rate:.2f} items/second")
+        if self.n_errors > 0:
+            self.logger.warning(f"Total errors encountered: {self.n_errors}")
+            if self.n_done > 0:
+                success = (self.n_done - self.n_errors) / self.n_done * 100
+                self.logger.warning(f"Success rate: {success:.1f}%")
+        else:
+            self.logger.info("No errors encountered - 100% success rate")

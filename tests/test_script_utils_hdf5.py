@@ -6,7 +6,7 @@ The conflict at line ~1151 combined two changes:
 
 We test these behaviours directly against inline versions of the loop,
 and via the HDF5-writing helper, without importing the full script_utils
-module (which has optional heavy dependencies: lmdb, wandb, etc.).
+module (which has optional heavy dependencies: wandb, etc.).
 """
 import tempfile
 

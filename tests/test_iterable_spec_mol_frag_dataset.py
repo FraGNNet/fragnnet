@@ -1,6 +1,13 @@
+import pytest
 import torch as th
+from torch.utils.data import DataLoader
 
 from fragnnet.dataset.iterable_spec_mol_frag_dataset import IterableSpecMolFragDataset
+
+
+def passthrough_collate(batch):
+    """Identity collate, mirroring how run_inference.py wires the DataLoader."""
+    return batch
 
 
 class FakePyG:
@@ -23,9 +30,13 @@ class FakeDataset:
         else:
             self.edge_counts = list(edge_counts)
         self.shared = shared
+        self.collate_fn_calls = 0
         if shared:
             # single shared pyg object returned for every index
             self._shared_pyg = FakePyG(self.node_counts[0], self.edge_counts[0])
+
+    def __len__(self):
+        return len(self.node_counts)
 
     def __getitem__(self, idx):
         if self.shared:
@@ -35,6 +46,8 @@ class FakeDataset:
         return {"frag_pyg": pyg, "idx": idx}
 
     def get_collate_fn(self):
+        self.collate_fn_calls += 1
+
         # simple collate that returns batch_size and the underlying samples list
         def collate_fn(data_list):
             return {"batch_size": th.tensor(len(data_list)), "samples": data_list}
@@ -115,3 +128,97 @@ def test_return_list_mode_and_clone():
     assert isinstance(batch, list)
     for sample in batch:
         assert sample["frag_pyg"] is not ds._shared_pyg
+
+
+def _make_iterable(node_counts, max_num, **kwargs):
+    ds = FakeDataset(node_counts)
+    it = IterableSpecMolFragDataset(
+        dataset=ds,
+        index_stream=range(len(node_counts)),
+        max_num=max_num,
+        limited_by="frag_node",
+        **kwargs,
+    )
+    return ds, it
+
+
+def test_no_len_because_batch_count_is_unknown():
+    """Batches form lazily, so the stream has no length (and neither does its DataLoader)."""
+    _, it = _make_iterable([3, 4, 5], max_num=7)
+    with pytest.raises(TypeError):
+        len(it)
+    with pytest.raises(TypeError):
+        len(DataLoader(it, batch_size=None, collate_fn=passthrough_collate))
+
+
+def test_missing_frag_pyg_raises_instead_of_unbounded_batch():
+    """A sample with no frag_pyg must fail loudly, not count as size 0 and grow the batch."""
+
+    class NoFragDataset(FakeDataset):
+        def __getitem__(self, idx):
+            return {"idx": idx}
+
+    ds = NoFragDataset([1, 1, 1])
+    it = IterableSpecMolFragDataset(
+        dataset=ds, index_stream=range(3), max_num=2, limited_by="frag_node"
+    )
+    with pytest.raises(KeyError, match="frag_pyg"):
+        list(it)
+
+
+def test_zero_size_samples_raise_instead_of_one_unbounded_batch():
+    """frag_edge is 0 for every sample in configs without fragment edges.
+
+    Sizing by it would never reach max_num, so the whole stream would land in one
+    batch and OOM. Must fail loudly and name the fix instead.
+    """
+    ds = FakeDataset([3, 4, 5], edge_counts=[0, 0, 0])
+    it = IterableSpecMolFragDataset(
+        dataset=ds, index_stream=range(3), max_num=8, limited_by="frag_edge"
+    )
+    with pytest.raises(ValueError, match="frag_node"):
+        list(it)
+
+    # the same samples batch fine when sized by nodes
+    it_ok = IterableSpecMolFragDataset(
+        dataset=ds, index_stream=range(3), max_num=8, limited_by="frag_node"
+    )
+    assert len(collect_batches(it_ok)) == 2
+
+
+def test_default_limited_by_is_frag_node():
+    """The default must be the metric that is always populated."""
+    ds = FakeDataset([3, 4], edge_counts=[0, 0])
+    it = IterableSpecMolFragDataset(dataset=ds, index_stream=range(2), max_num=5)
+    batches = collect_batches(it)
+    assert len(batches) == 2  # sized by nodes: 3 then 4, so they split
+
+
+def test_collate_fn_fetched_once_per_iteration():
+    """get_collate_fn() is hoisted out of the per-batch path."""
+    ds, it = _make_iterable([1] * 10, max_num=2)
+    batches = collect_batches(it)
+    assert len(batches) == 5
+    assert ds.collate_fn_calls == 1
+
+
+def test_collate_fn_not_fetched_when_uncollated():
+    ds, it = _make_iterable([1, 1], max_num=2, return_collated=False)
+    collect_batches(it)
+    assert ds.collate_fn_calls == 0
+
+
+def test_dataloader_passthrough_covers_every_index_once():
+    """DataLoader(batch_size=None) must hand back the dataset's own batches untouched."""
+    node_counts = [3, 4, 5, 2, 1, 6]
+    _, it = _make_iterable(node_counts, max_num=7)
+    dl = DataLoader(it, batch_size=None, collate_fn=passthrough_collate)
+
+    batches = list(dl)
+    seen = [s["idx"] for b in batches for s in b["samples"]]
+    assert sorted(seen) == list(range(len(node_counts)))
+    for b in batches:
+        # batch_size must survive as the collate output, not be re-batched into a list
+        assert isinstance(b, dict)
+        assert int(b["batch_size"]) == len(b["samples"])
+        assert sum(s["frag_pyg"].num_nodes for s in b["samples"]) <= 7

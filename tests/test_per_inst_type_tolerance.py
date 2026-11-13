@@ -21,7 +21,9 @@ from fragnnet.model.loss import (
     sparse_cross_entropy_vec,
     sparse_jensen_shannon_divergence_hungarian,
 )
+from fragnnet.pl_model.fragnnet_pl import FraGNNetPL
 from fragnnet.pl_model.spectrum_pl import SpectrumPL
+from fragnnet.runner import load_config
 from fragnnet.utils.spec_utils import calculate_match_mzs
 
 # ---------------------------------------------------------------------------
@@ -776,3 +778,47 @@ class TestFTFloorAdequacy:
         )[0, 0].item()
         assert not close_pair_tight, "0.005 Da pair at m/z 50 — correct floor (0.002 Da) → no match"
         assert close_pair_loose, "0.005 Da pair at m/z 50 — raised floor (0.010 Da) → false match"
+
+
+class TestInstTolScoresRequireConfig:
+    """`cos_hun_inst_tol` / `jss_hun_inst_tol` must fail at setup without the lookup.
+
+    `_common_step` only computes them when `inst_tol_lookup` is not None, but they are
+    registered as metric names regardless, so the exporters wrote a column of -1 for every
+    spectrum and the run reported success. `inst_type_loss_tol` is null in
+    `config/template.yml` while `run_save_inference_eval.py` asks for `cos_hun_inst_tol` by
+    default, so the broken combination is the one you get by not thinking about it.
+    """
+
+    TOL = {"FT": {"rel": 1e-5, "min_mz": 200.0}, "QTOF": {"rel": 2e-5, "min_mz": 750.0}}
+
+    @staticmethod
+    def _model(auxiliary_scores, inst_type_loss_tol):
+        config = load_config("config/template.yml", None, None)
+        config.update(
+            model_type="frag_gnn",
+            compile=False,
+            sparse_cosine_similarity=True,
+            auxiliary_scores=auxiliary_scores,
+            inst_type_loss_tol=inst_type_loss_tol,
+        )
+        return FraGNNetPL(**config)
+
+    @pytest.mark.parametrize("score", ["cos_hun_inst_tol", "jss_hun_inst_tol"])
+    def test_requested_without_tolerances_raises(self, score):
+        with pytest.raises(ValueError, match="inst_type_loss_tol"):
+            self._model(["cos_sim", score], None)
+
+    def test_error_names_every_offending_score(self):
+        with pytest.raises(ValueError, match=r"cos_hun_inst_tol.*jss_hun_inst_tol"):
+            self._model(["cos_hun_inst_tol", "jss_hun_inst_tol"], None)
+
+    def test_configured_tolerances_build_the_lookup(self):
+        model = self._model(["cos_sim", "cos_hun_inst_tol"], self.TOL)
+        assert model.inst_tol_lookup is not None
+        assert model.inst_min_mz_lookup is not None
+
+    def test_other_scores_keep_the_no_lookup_fast_path(self):
+        """Not requesting them must still allow inst_type_loss_tol to be unset."""
+        model = self._model(["cos_sim"], None)
+        assert model.inst_tol_lookup is None

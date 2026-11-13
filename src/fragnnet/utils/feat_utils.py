@@ -5,6 +5,7 @@ and bonds. Inspired by the dgllife library.
 
 """
 
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -14,6 +15,7 @@ import scipy
 import torch as th
 import torch_geometric as pyg
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from torch_geometric.data import Data
 
 from fragnnet.utils.data_utils import (
@@ -27,6 +29,7 @@ from fragnnet.utils.frag_utils import (
     NODE_FEAT_TO_IDX,
     get_edge_feats,
     get_node_feats,
+    th_long_to_mask,
 )
 
 # TODO: remove this registry
@@ -104,6 +107,7 @@ class MolGraph:
             self.b_featurizers.append(feat_obj["fn"])
 
         self.num_atom_feats += self.pe_embed_k
+        self.needs_gasteiger = "a_charge" in self.atom_feats
 
     def get_mol_graph(
         self,
@@ -120,6 +124,8 @@ class MolGraph:
             Mapping containing atom features (|N| x d_n), bond features (|E| x d_e),
             and bond index tuples (|E| x 2).
         """
+        if self.needs_gasteiger:
+            AllChem.ComputeGasteigerCharges(mol)
         all_atoms = mol.GetAtoms()
         all_bonds = mol.GetBonds()
         bond_feats = []
@@ -141,8 +147,15 @@ class MolGraph:
             atom_feats.append(atom_feat)
 
         atom_feats = np.array(atom_feats)
-        bond_feats = np.array(bond_feats)
-        bond_tuples = np.array(bond_tuples)
+        if len(bond_tuples) == 0:
+            # Bond-free molecule (a lone heavy atom such as CH4 or HCl). np.array([]) is
+            # 1-D, so give the empty arrays their real 2-D shape or every consumer below
+            # (and every downstream reshape/transpose) indexes a phantom axis.
+            bond_feats = np.zeros((0, self.num_bond_feats), dtype=np.int64)
+            bond_tuples = np.zeros((0, 2), dtype=np.int64)
+        else:
+            bond_feats = np.array(bond_feats)
+            bond_tuples = np.array(bond_tuples)
 
         # Add doubles
         if bigraph:
@@ -361,7 +374,13 @@ class AtomRadical(FeatBase):
 
 @register_atom_feat
 class AtomRing(FeatBase):
-    """Atom Ring and Atom Aromatic features are one-hot encoded."""
+    """Atom Ring and Atom Aromatic features are one-hot encoded.
+
+    TODO: when used together with a_ring_size, the is_in_ring bits here are
+    redundant (a_ring_size all-zero ↔ not in ring). The is_aromatic bits are
+    NOT redundant (ring size does not imply aromaticity). Consider splitting into
+    a standalone a_aromatic feature and dropping a_ring to eliminate the overlap.
+    """
 
     name = "a_ring"
     allowable_set = [True, False]
@@ -428,6 +447,87 @@ class AtomMass(FeatBase):
             List containing normalized atomic mass value.
         """
         return [x.GetMass() * cls.coef]
+
+
+@register_atom_feat
+class AtomRingSize(FeatBase):
+    """Ring size membership features for atoms.
+
+    Five binary bits: IsInRingOfSize(3), IsInRingOfSize(4), IsInRingOfSize(5),
+    IsInRingOfSize(6), and any ring of size ≥7. All zero for non-ring atoms.
+    Complements a_ring (which only encodes is_in_ring and is_aromatic).
+    """
+
+    name = "a_ring_size"
+    feat_size = 5
+
+    @classmethod
+    def featurize(cls, x: Chem.rdchem.Atom) -> list[int]:
+        """Encode atom ring size membership.
+
+        Args:
+            x: RDKit atom object.
+
+        Returns:
+            Binary list of length 5: [in3, in4, in5, in6, inGe7].
+        """
+        ring_info = x.GetOwningMol().GetRingInfo()
+        idx = x.GetIdx()
+        in_small = [ring_info.IsAtomInRingOfSize(idx, s) for s in (3, 4, 5, 6)]
+        in_ge7 = x.IsInRing() and not any(in_small)
+        return [int(v) for v in in_small] + [int(in_ge7)]
+
+
+@register_atom_feat
+class AtomCharge(FeatBase):
+    """Gasteiger partial charge (continuous scalar).
+
+    Requires AllChem.ComputeGasteigerCharges to have been called on the molecule
+    before featurization. MolGraph handles this automatically when 'a_charge' is
+    in the atom feature list.
+    """
+
+    name = "a_charge"
+    feat_size = 1
+
+    @classmethod
+    def featurize(cls, x: Chem.rdchem.Atom) -> list[float]:
+        """Return Gasteiger partial charge of the atom.
+
+        Args:
+            x: RDKit atom object.
+
+        Returns:
+            List containing the Gasteiger partial charge value, or 0.0 on failure.
+        """
+        v = x.GetDoubleProp("_GasteigerCharge")
+        return [0.0 if math.isnan(v) or math.isinf(v) else v]
+
+
+@register_atom_feat
+class AtomNumHs(FeatBase):
+    """Total hydrogen count (implicit + explicit) per atom, one-hot encoded.
+
+    Encodes the mobile proton pool at each atom site, directly relevant to
+    H-rearrangement fragmentation pathways (McLafferty, retro-Diels-Alder).
+    Complements a_degree which only captures heavy-atom connectivity.
+    """
+
+    name = "a_num_hs"
+    allowable_set = [0, 1, 2, 3]
+    feat_size = len(allowable_set) + 1
+
+    @classmethod
+    def featurize(cls, x: Chem.rdchem.Atom) -> list[int]:
+        """One-hot encode total hydrogen count on the atom.
+
+        Args:
+            x: RDKit atom object.
+
+        Returns:
+            One-hot encoded H count vector of length 5: [0, 1, 2, 3, ≥4].
+        """
+        return one_hot_encoding(x.GetTotalNumHs(), cls.allowable_set, True)
 
 
 @register_bond_feat
@@ -744,6 +844,7 @@ def get_frag_graph(
     frag_edge_feats: Sequence[str],
     edges: bool,
     bigraph: bool,
+    gasteiger_arr: np.ndarray | None = None,
 ) -> Data:
     """Subselect DAG features and optionally symmetrize edges for fragments.
 
@@ -753,6 +854,8 @@ def get_frag_graph(
         frag_edge_feats: Sequence of edge feature names to include.
         edges: Whether to include edges in the output graph.
         bigraph: Whether to symmetrize edges by adding reverse directions.
+        gasteiger_arr: Per-atom Gasteiger partial charges of shape (num_atoms,).
+            Required when "frag_q" is in frag_node_feats; zeros used if None.
 
     Returns:
         PyTorch Geometric Data object with selected features and optionally symmetrized edges.
@@ -770,17 +873,35 @@ def get_frag_graph(
     node_feat_idxs = dag_pyg.node_feat_idxs.long()
     edge_feat_idxs = dag_pyg.edge_feat_idxs.long()
     # select node features
+    # TODO: out_degree / in_degree / num_heavy_atoms are computed on-the-fly here for now
+    # (avoids DAG regeneration during testing). Once validated, move the computation into
+    # compute_dags in frag_utils.py and store them in dag.x like other features.
     _x = []
     _node_feat_idxs = [0]
     _node_feat_size = 0
+    num_nodes = x.shape[0]
     for feat, _ in NODE_FEAT_TO_IDX.items():
         if feat in frag_node_feats:
-            _x_cur = get_node_feats(x, node_feat_idxs[0], feat)
+            if feat == "out_degree":  # on-the-fly: count outgoing edges per node
+                _x_cur = th.zeros(num_nodes, 1, device=device, dtype=th.int64)
+                if edge_index.shape[1] > 0:
+                    _x_cur.scatter_add_(0, edge_index[0].unsqueeze(1), th.ones_like(edge_index[0].unsqueeze(1)))
+            elif feat == "in_degree":  # on-the-fly: count incoming edges per node
+                _x_cur = th.zeros(num_nodes, 1, device=device, dtype=th.int64)
+                if edge_index.shape[1] > 0:
+                    _x_cur.scatter_add_(0, edge_index[1].unsqueeze(1), th.ones_like(edge_index[1].unsqueeze(1)))
+            elif feat == "num_heavy_atoms":  # on-the-fly: sum base_formula (H col is already 0)
+                _x_cur = get_node_feats(x, node_feat_idxs[0], "base_formula").sum(dim=1, keepdim=True)
+            else:
+                _x_cur = get_node_feats(x, node_feat_idxs[0], feat)
             _x.append(_x_cur)
             _node_feat_size += _x_cur.shape[1]
             # print(feat,feat_idx,_node_feat_size)
         _node_feat_idxs.append(_node_feat_size)
-    _x = th.cat(_x, dim=1)
+    if len(_x) == 0:
+        _x = th.zeros(num_nodes, 0, device=device, dtype=th.int64)
+    else:
+        _x = th.cat(_x, dim=1)
     _node_feat_idxs = th.tensor(_node_feat_idxs, device=device, dtype=th.int64).reshape(1, -1)
     # select edge features
     _edge_index = edge_index.clone()
@@ -823,6 +944,15 @@ def get_frag_graph(
     for attr_name in ("boundary_pair_frag_idxs", "boundary_pair_in_local", "boundary_pair_out_local"):
         if hasattr(source_dag_pyg, attr_name):
             setattr(dag_pyg, attr_name, getattr(source_dag_pyg, attr_name))
+    if "frag_q" in frag_node_feats:
+        if gasteiger_arr is None:
+            frag_q = th.zeros(num_nodes, 1, dtype=th.float32, device=device)
+        else:
+            cc_long = get_node_feats(x, node_feat_idxs[0], "cc").long()
+            cc_binary = th_long_to_mask(cc_long)[:, : len(gasteiger_arr)].float()
+            g_arr = th.as_tensor(gasteiger_arr, dtype=th.float32, device=device)
+            frag_q = (cc_binary @ g_arr).unsqueeze(1)
+        dag_pyg.frag_q = frag_q
     return dag_pyg
 
 
@@ -848,12 +978,17 @@ def random_walk_pe(g: Data, k: int) -> th.Tensor:
         tensor([[0.0000, 0.5000],
                 [0.5000, 0.7500]])
     """
-    # sparse adjacency matrix
+    # Sparse adjacency matrix. The shape is passed explicitly rather than inferred from the
+    # largest index: inference gives (max_row + 1, max_col + 1), which is wrong whenever an
+    # atom is missing from either endpoint list. A bond-free molecule (a lone heavy atom)
+    # has no indices at all and cannot be inferred from, and a directed (bigraph=False)
+    # graph is generally not even square.
     A = scipy.sparse.csr_matrix(
         (
             th.ones_like(g.edge_index[0]).numpy(),
             (g.edge_index[0].numpy(), g.edge_index[1].numpy()),
-        )
+        ),
+        shape=(g.num_nodes, g.num_nodes),
     )
     RW = A / (A.sum(1).reshape(-1, 1) + 1e-30)  # 1-step transition probability
 

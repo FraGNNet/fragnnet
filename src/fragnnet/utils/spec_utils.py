@@ -405,6 +405,49 @@ def batched_filter_func(
     return mzs, ints, batch_idxs
 
 
+def batched_rel_filter_func(
+    mzs: th.Tensor,
+    ints: th.Tensor,
+    batch_idxs: th.Tensor,
+    rel_thresh: float,
+    mz_max: float = 0.0,
+    dim_size: int | None = None,
+) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    """Filter peaks whose intensity is below a per-spectrum relative threshold.
+
+    Args:
+        mzs: 1-D tensor of m/z values, concatenated across batch.
+        ints: 1-D tensor of raw intensities, concatenated across batch.
+        batch_idxs: 1-D tensor of batch indices, same length as mzs/ints.
+        rel_thresh: Fraction of per-spectrum maximum intensity below which peaks
+            are dropped (e.g. 0.01 keeps only peaks ≥ 1 % of that spectrum's max).
+            A value of 0.0 is a no-op.
+        mz_max: If positive, also drop peaks at or above this m/z. Defaults to 0.0 (disabled).
+        dim_size: Number of spectra in the batch, if already known on the host. Passing this
+            avoids a `th.max(batch_idxs).item()` device sync; omit only when the caller
+            genuinely does not know the batch size in advance.
+
+    Returns:
+        Filtered (mzs, ints, batch_idxs) tensors.
+    """
+    if rel_thresh <= 0.0 and mz_max <= 0.0:
+        return mzs, ints, batch_idxs
+
+    if rel_thresh > 0.0:
+        # Per-spectrum maxima are only needed for a positive relative threshold. With
+        # rel_thresh == 0.0 the comparison below reduces to `ints > 0`, so computing them
+        # would be a scatter plus a host sync whose result is multiplied by zero.
+        if dim_size is None:
+            dim_size = int(th.max(batch_idxs).item()) + 1
+        max_ints = scatter_reduce(ints, batch_idxs, reduce="max", dim_size=dim_size)
+        mask = ints > rel_thresh * max_ints[batch_idxs]
+    else:
+        mask = ints > 0
+    if mz_max > 0.0:
+        mask = mask & (mzs < mz_max)
+    return mzs[mask], ints[mask], batch_idxs[mask]
+
+
 def batched_bin_func(
     mzs: th.Tensor,
     ints: th.Tensor,

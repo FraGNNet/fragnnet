@@ -583,3 +583,132 @@ class FragModeScaler(nn.Module):
         log_scale = mode_params_per_node[:, : self.output_dim]
         bias = mode_params_per_node[:, self.output_dim :]
         return logits * th.exp(log_scale) + bias
+
+
+class AdductScaler(nn.Module):
+    """Adduct-type-conditioned FiLM output scaling layer.
+
+    Applies a per-adduct-type learned scale and bias to the raw logit output of the
+    intensity head, allowing the model to correct systematic intensity shifts for
+    rare adducts (``[M+Na]+``, ``[M+Cl]-``, ``[M-H]-``) relative to ``[M+H]+``.
+
+    The transform is: ``logits_out = logits * exp(log_scale) + bias``
+
+    Both ``log_scale`` and ``bias`` are initialised to zero so the layer starts as the
+    identity transform.
+
+    Attributes:
+        params: Embedding of shape ``(num_adduct_types + 1, output_dim * 2)`` storing
+            ``(log_scale, bias)`` for each adduct.  Index ``num_adduct_types`` is the
+            fallback unknown token.
+    """
+
+    def __init__(self, num_adduct_types: int, output_dim: int) -> None:
+        """Initialize the AdductScaler.
+
+        Args:
+            num_adduct_types: Number of known adduct/precursor types (unknown handled as +1).
+            output_dim: Dimension of the logit output to scale (mlp_output_dim).
+        """
+        super().__init__()
+        self.output_dim = output_dim
+        self.params = nn.Embedding(num_adduct_types + 1, output_dim * 2)
+        nn.init.zeros_(self.params.weight)
+
+    def forward(
+        self,
+        logits: th.Tensor,
+        prec_type: th.Tensor,
+        node_batch_idxs: th.Tensor,
+    ) -> th.Tensor:
+        """Apply per-adduct affine scaling to the intensity logits.
+
+        Args:
+            logits: Raw MLP logits of shape (num_nodes, output_dim).
+            prec_type: Per-sample adduct indices of shape (batch_size,).
+            node_batch_idxs: Batch index for each node of shape (num_nodes,).
+
+        Returns:
+            Scaled logits of shape (num_nodes, output_dim).
+        """
+        adduct_params = self.params(prec_type)
+        adduct_params_per_node = adduct_params[node_batch_idxs]
+        log_scale = adduct_params_per_node[:, : self.output_dim]
+        bias = adduct_params_per_node[:, self.output_dim :]
+        return logits * th.exp(log_scale) + bias
+
+
+class StratumScaler(nn.Module):
+    """Combined acquisition-stratum FiLM output scaling layer.
+
+    Conditions on instrument type, fragmentation mode, and adduct type simultaneously.
+    Each categorical axis has its own small embedding table; the three embeddings are
+    summed and projected to per-H-shift ``(log_scale, bias)`` pairs.
+
+    The transform is: ``logits_out = logits * exp(log_scale) + bias``
+
+    The projection is initialised to zero so the layer starts as the identity transform.
+
+    Attributes:
+        inst_emb: Embedding for instrument type, shape ``(num_inst_types + 1, embed_dim)``.
+        frag_mode_emb: Embedding for fragmentation mode, shape ``(num_frag_modes + 1, embed_dim)``.
+        prec_emb: Embedding for adduct/precursor type, shape ``(num_adduct_types + 1, embed_dim)``.
+        proj: Linear projection from ``embed_dim`` to ``output_dim * 2``.
+    """
+
+    def __init__(
+        self,
+        num_inst_types: int,
+        num_frag_modes: int,
+        num_adduct_types: int,
+        embed_dim: int,
+        output_dim: int,
+    ) -> None:
+        """Initialize the StratumScaler.
+
+        Args:
+            num_inst_types: Number of known instrument types (unknown handled as +1).
+            num_frag_modes: Number of known fragmentation modes (unknown handled as +1).
+            num_adduct_types: Number of known adduct/precursor types (unknown handled as +1).
+            embed_dim: Dimension of each categorical embedding before projection.
+            output_dim: Dimension of the logit output to scale (mlp_output_dim).
+        """
+        super().__init__()
+        self.output_dim = output_dim
+        self.inst_emb = nn.Embedding(num_inst_types + 1, embed_dim)
+        self.frag_mode_emb = nn.Embedding(num_frag_modes + 1, embed_dim)
+        self.prec_emb = nn.Embedding(num_adduct_types + 1, embed_dim)
+        self.proj = nn.Linear(embed_dim, output_dim * 2)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(
+        self,
+        logits: th.Tensor,
+        inst_type: th.Tensor,
+        frag_mode: th.Tensor,
+        prec_type: th.Tensor,
+        node_batch_idxs: th.Tensor,
+    ) -> th.Tensor:
+        """Apply per-stratum affine scaling to the intensity logits.
+
+        Args:
+            logits: Raw MLP logits of shape (num_nodes, output_dim).
+            inst_type: Per-sample instrument indices of shape (batch_size,).
+            frag_mode: Per-sample fragmentation mode indices of shape (batch_size,).
+            prec_type: Per-sample adduct indices of shape (batch_size,).
+            node_batch_idxs: Batch index for each node of shape (num_nodes,).
+
+        Returns:
+            Scaled logits of shape (num_nodes, output_dim).
+        """
+        stratum = (
+            self.inst_emb(inst_type)
+            + self.frag_mode_emb(frag_mode)
+            + self.prec_emb(prec_type)
+        )  # (batch_size, embed_dim)
+        params = self.proj(stratum)  # (batch_size, output_dim * 2)
+        params_per_node = params[node_batch_idxs]
+        log_scale = params_per_node[:, : self.output_dim]
+        bias = params_per_node[:, self.output_dim :]
+        return logits * th.exp(log_scale) + bias

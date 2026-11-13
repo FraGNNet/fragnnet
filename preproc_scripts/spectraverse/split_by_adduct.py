@@ -10,11 +10,14 @@ Output structure:
 
 where adduct_tag is a sanitized version of the adduct string (e.g., m+h, m-h).
 
+Note: train, val and test are ALL filtered to the requested adduct (unlike the
+train-only variants, which leave val/test unfiltered).
+
 Usage:
     python preproc_scripts/spectraverse/split_by_adduct.py \
-        --split_root data/split/spectraverse_benchmark \
-        --spec_fp data/proc/spectraverse/spec_df.pkl \
-        --output_root data/split/spectraverse_neims_adduct \
+        --split_root data/split/spectraverse_1_0_3_benchmark \
+        --spec_fp data/proc/spectraverse_1_0_3/spec_df.pkl \
+        --output_root data/split/spectraverse_benchmark_1_0_3_neims_adduct \
         --adducts "[M+H]+" "[M-H]-" "[M+Na]+"
 """
 
@@ -82,17 +85,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--split_root",
-        default="data/split/spectraverse_benchmark",
+        default="data/split/spectraverse_1_0_3_benchmark",
         help="Root dir containing cv0, cv1, ... subdirectories.",
     )
     parser.add_argument(
         "--spec_fp",
-        default="data/proc/spectraverse/spec_df.pkl",
+        default="data/proc/spectraverse_1_0_3/spec_df.pkl",
         help="Path to spec_df.pkl.",
     )
     parser.add_argument(
         "--output_root",
-        default="data/split/spectraverse_neims_adduct",
+        default="data/split/spectraverse_benchmark_1_0_3_neims_adduct",
         help="Root dir for output per-adduct split directories.",
     )
     parser.add_argument(

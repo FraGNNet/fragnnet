@@ -2,19 +2,27 @@ import argparse
 import json
 import logging
 import os
-import pickle
 from typing import cast
 
-import lmdb
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 import fragnnet.utils.data_utils as data_utils
 import fragnnet.utils.frag_utils as frag_utils
 from fragnnet.utils.frag_utils import run_frag_gen_hdf5
-from fragnnet.utils.misc_utils import booltype, progress_wrapper
+from fragnnet.utils.misc_utils import ProgressLogger, booltype, progress_wrapper
 from fragnnet.utils.proc_utils import filter_spec_mol, merge_spec_df
+
+# Default per-instrument m/z tolerance, matching inst_type_loss_tol in the training configs
+# (e.g. config/exp_fraggnn_ma_mi/fraggnn_d3_ma_mi_nist20_amolc_all.yml) and the
+# cos_hun_inst_tol_opt convention in scripts/eval/dag_oracle_scores.py. Instrument types
+# not listed here fall back to a plain 10 ppm relative tolerance. Overridable via
+# --inst_type_loss_tol (JSON).
+DEFAULT_INST_TYPE_LOSS_TOL = {
+    "FT": {"rel": 1.0e-5, "min_mz": 200.0},  # 10 ppm, floor 200 Da
+    "ORB": {"rel": 1.0e-5, "min_mz": 200.0},  # Spectraverse v1.0.3 Orbitrap label
+    "QTOF": {"rel": 2.0e-5, "min_mz": 750.0},  # 20 ppm, floor 750 Da (covers truncation artifact)
+}
 
 
 def print_and_log(name: str, series: pd.Series, wandb_flag: bool, stats_d: dict) -> None:
@@ -39,6 +47,36 @@ def print_and_log(name: str, series: pd.Series, wandb_flag: bool, stats_d: dict)
         wandb.log(log_d)
 
 
+def log_frag_output_summary(args, h5_fp: str, dag_dp: str) -> None:
+    """Log the on-disk size of whatever the frag gen step just wrote.
+
+    Both the HDF5 and the per-molecule-pickle layouts report their footprint the
+    same way, so a job's log ends with a comparable line whichever one it wrote.
+
+    Args:
+        args: Parsed CLI namespace (``use_hdf5`` selects which layout to report).
+        h5_fp: Path to ``dags.h5``, used when ``args.use_hdf5`` is set.
+        dag_dp: Directory holding per-molecule pickles, used otherwise.
+    """
+    try:
+        if args.use_hdf5:
+            size_mb = os.path.getsize(h5_fp) / (1024 * 1024)
+            logging.info(f"Wrote packed HDF5: {h5_fp}")
+            logging.info(f"Total output size: {size_mb:.2f} MB")
+        else:
+            output_files = [
+                f for f in os.listdir(dag_dp) if f.endswith((".pkl", ".pkl.gz", ".pkl.bz2"))
+            ]
+            total_size = sum(os.path.getsize(os.path.join(dag_dp, f)) for f in output_files) / (
+                1024 * 1024
+            )
+            logging.info(f"Generated {len(output_files)} fragment files in {dag_dp}")
+            logging.info(f"Total output size: {total_size:.2f} MB")
+    except Exception as e:
+        logging.warning(f"Could not analyze output directory: {e}")
+    logging.info("=" * 60)
+
+
 def main(args):
     if args.max_time >= data_utils.JOBLIB_TIMEOUT:
         raise ValueError(
@@ -46,21 +84,25 @@ def main(args):
             f"({data_utils.JOBLIB_TIMEOUT}s)"
         )
 
-    # Setup logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    # Setup logging. datefmt is explicit so asctime renders as "2026-09-14 22:06:53"
+    # rather than logging's default "2026-09-14 22:06:53,924".
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.info("=" * 60)
+    logging.info("Starting DAG Feature Preparation Pipeline")
+    logging.info("=" * 60)
+    logging.info("Configuration parameters:")
+    for k, v in vars(args).items():
+        logging.info(f"  {k}: {v}")
+    logging.info("-" * 40)
 
     if args.compress_dags and args.compress_format not in {"gz", "bz2"}:
         raise ValueError(
             f"Invalid --compress_format '{args.compress_format}'. Expected one of: 'gz', 'bz2'."
         )
-
-    if args.use_lmdb and args.compress_dags:
-        logging.info(
-            "--compress_dags is ignored when --use_lmdb=True because DAGs are stored in LMDB."
-        )
-
-    if args.use_hdf5 and args.use_lmdb:
-        raise ValueError("--use_hdf5 and --use_lmdb are mutually exclusive.")
 
     elements = args.elements
     dsets = args.dsets
@@ -115,8 +157,6 @@ def main(args):
         print(f">> WARNING: mol_df has {n_dup} duplicate mol_ids — deduplicating")
         mol_df = mol_df.drop_duplicates(subset=["mol_id"]).reset_index(drop=True)
 
-    m_spec_df = merge_spec_df(spec_df)
-
     print(
         f">> {len(spec_df)} spectra, {len(mol_df)} molecules"
     )  # , {len(m_spec_df)} merged spectra")
@@ -143,17 +183,26 @@ def main(args):
         idx_by_h_delta,
         prec_mz,
         prec_type,
+        inst_type,
         tolerances: list,
         max_h_transfer: int,
     ):
-        """_summary_
+        """Compute per-spectrum DAG coverage stats across tolerances and H-transfer budgets.
+
+        In addition to each fixed tolerance in ``tolerances``, an ``inst_tol`` variant is
+        emitted that uses the per-instrument m/z tolerance in ``args.inst_type_loss_tol``
+        (default: FT 10 ppm/200 Da, QTOF 20 ppm/750 Da; other instrument types fall back
+        to 10 ppm).
+        This mirrors the ``cos_hun_inst_tol_opt`` convention in
+        ``scripts/eval/dag_oracle_scores.py`` so recall/wrecall use the same matching logic.
 
         Args:
-            tolerances (list): _description_
-            h_transfer (int): _description_
+            inst_type: Instrument type for this spectrum, used to select the inst-tol tolerance.
+            tolerances: Fixed tolerance labels (e.g. "0.01", "10ppm").
+            max_h_transfer: Maximum H-transfer budget; stats are emitted for each h in 1..max.
 
         Returns:
-            _type_: _description_
+            One-row DataFrame with a column per (stat, tolerance, h_transfer).
         """
         results = []
         cols = []
@@ -193,6 +242,36 @@ def main(args):
                     )
                 cols += keys
                 results.append(result)
+
+        # Per-instrument tolerance variant (inst_tol). The base tolerance=10/is_ppm=True is
+        # the 10 ppm fallback for instrument types absent from args.inst_type_loss_tol; for
+        # FT/ORB/QTOF it is overridden per-peak by inst_type_tol.
+        for h_transfer in range(1, max_h_transfer + 1):
+            cols += [
+                f"recall_inst_tol_h{h_transfer}",
+                f"wrecall_inst_tol_h{h_transfer}",
+                f"prec_inst_tol_h{h_transfer}",
+                f"ppt_peak_inst_tol_h{h_transfer}",
+                f"ppt_formula_inst_tol_h{h_transfer}",
+                f"prec_recall_inst_tol_h{h_transfer}",
+                f"prec_spec_recall_inst_tol_h{h_transfer}",
+            ]
+            results.append(
+                frag_utils.compute_frag_peak_stats(
+                    peaks,
+                    formula_peak_mzs,
+                    formula_peak_probs,
+                    idx_by_h_delta,
+                    prec_mz,
+                    h_transfer,
+                    tolerance=10.0,
+                    prec_type=prec_type,
+                    is_ppm=True,
+                    inst_type=inst_type,
+                    inst_type_tol=args.inst_type_loss_tol,
+                )
+            )
+
         result_series = pd.concat(results, axis=0)
         result_df = result_series.to_frame().T
         result_df.columns = cols
@@ -218,7 +297,11 @@ def main(args):
         for _, row in mol_df.iterrows()
     )
 
-    print("> Running frag gen")
+    logging.info("Running frag gen")
+    logging.info(
+        f"  Output layout: {'packed HDF5 (dags.h5)' if args.use_hdf5 else 'one pickle per molecule'}"
+    )
+    logging.info(f"  Molecules to fragment: {mol_df.shape[0]}")
     h5_fp = os.path.join(args.frag_dp, "dags.h5")
     meta_info_fp = os.path.join(args.frag_dp, "meta_info.json")
 
@@ -244,29 +327,16 @@ def main(args):
             )
         with open(meta_info_fp, "w") as f:
             f.write(json.dumps(meta_info))
+        log_frag_output_summary(args, h5_fp, dag_dp)
         return
 
     # Full path: keep loop so stats can be accumulated alongside DAG writes.
-    if args.use_lmdb:
-        env = lmdb.open(
-            dag_dp,
-            map_size=args.map_size,
-            meminit=False,
-            map_async=True,
-        )
-        txn = env.begin(write=True)
-        if txn is None:
-            raise RuntimeError("Failed to open LMDB write transaction")
-        h5_file = None
-    elif args.use_hdf5:
+    if args.use_hdf5:
         import h5py
 
         h5_file = h5py.File(h5_fp, "w")
-        env = None
-        txn = None
+        frag_utils.initialize_packed_dag_hdf5(h5_file)
     else:
-        env = None
-        txn = None
         h5_file = None
     frag_results_gen = data_utils.par_apply(
         iter(mol_input_rows), frag_utils.timed_get_dags, True, return_as_generator=True
@@ -276,74 +346,99 @@ def main(args):
     frag_results_iter = cast("list[tuple[str, dict]]", frag_results_gen)
     frag_results = []
     meta_info = {}
-    for fr in progress_wrapper(
-        frag_results_iter,
-        total=mol_df.shape[0],
-        desc="Compute Frags",
-        disable_tqdm=args.disable_tqdm,
-    ):
+    oom_mol_ids = []
+    n_total = mol_df.shape[0]
+    _STATS_KEYS = {
+        "max_depth",
+        "formula_peak_mzs",
+        "formula_peak_probs",
+        "idx_to_formula",
+        "dag_num_edges",
+        "dag_num_nodes",
+        "dag_sparsity",
+        "dag_num_nodes_nb",
+        "formula_redundancy",
+        "idx_by_h_delta",
+    }
+    meta_info_checkpoint_fp = os.path.join(args.frag_dp, "meta_info_checkpoint.json")
+    logging.info(f"Executing fragment generation for {n_total} molecules")
+    progress = ProgressLogger(total=n_total, desc="Fragment generation")
+    # tqdm is always disabled for this loop to avoid issues with parallel processing;
+    # ProgressLogger supplies the rate/ETA reporting in its place.
+    for i, fr in enumerate(frag_results_iter):
         mol_id, dag_d = fr
 
+        # Log before any processing so the last entry in the log identifies the OOM culprit.
+        logging.debug(f"Processing mol_id={mol_id} ({i + 1}/{n_total})")
+
+        stats_row: dict = {}
+        had_error = False
         if len(dag_d) == 0:
-            print("error in ", mol_id)
+            logging.warning(f"Fragmentation failed for mol_id={mol_id}")
+            had_error = True
         else:
             meta_info[mol_id] = [dag_d["dag"].num_nodes, dag_d["dag"].num_edges]
-            if args.use_lmdb:
-                if txn is None or env is None:
-                    raise RuntimeError("LMDB environment was not initialized")
-                txn.put(
-                    f"{int(mol_id)}".encode(), pickle.dumps(dag_d, protocol=pickle.HIGHEST_PROTOCOL)
-                )
-                if (int(mol_id) + 1) % 200 == 0:
-                    txn.commit()
-                    txn = env.begin(write=True)
-            elif args.use_hdf5:
-                if h5_file is None:
-                    raise RuntimeError("HDF5 file was not initialized")
-                grp = h5_file.create_group(f"{int(mol_id)}")
-                frag_utils.dump_dag_hdf5(grp, dag_d)
-            else:
-                # Write one artifact per molecule when LMDB storage is disabled.
-                fp = frag_utils.get_dag_output_path(
-                    dag_dp=dag_dp,
-                    mol_id=mol_id,
-                    compress_dags=args.compress_dags,
-                    compress_format=args.compress_format,
-                )
-                frag_utils.dump_dag_pickle(fp, dag_d)
-        if not args.skip_stats:
-            # Only retain the lightweight stats keys — the DGL graph (dag_d["dag"])
-            # is already serialised to disk above and must not be held in memory.
-            _STATS_KEYS = {
-                "max_depth",
-                "formula_peak_mzs",
-                "formula_peak_probs",
-                "idx_to_formula",
-                "dag_num_edges",
-                "dag_num_nodes",
-                "dag_sparsity",
-                "dag_num_nodes_nb",
-                "formula_redundancy",
-                "idx_by_h_delta",
-            }
-            frag_results.append({k: dag_d[k] for k in _STATS_KEYS if k in dag_d})
+            if not args.skip_stats:
+                stats_row = {k: dag_d[k] for k in _STATS_KEYS if k in dag_d}
+            try:
+                if args.use_hdf5:
+                    if h5_file is None:
+                        raise RuntimeError("HDF5 file was not initialized")
+                    frag_utils.dump_dag_hdf5_packed(h5_file, mol_id, dag_d)
+                else:
+                    # Write one artifact per molecule when HDF5 storage is disabled.
+                    fp = frag_utils.get_dag_output_path(
+                        dag_dp=dag_dp,
+                        mol_id=mol_id,
+                        compress_dags=args.compress_dags,
+                        compress_format=args.compress_format,
+                    )
+                    frag_utils.dump_dag_pickle(fp, dag_d)
+            except MemoryError:
+                logging.error(f"OOM (MemoryError) writing DAG for mol_id={mol_id} — skipping")
+                oom_mol_ids.append(mol_id)
+                stats_row = {}
+                had_error = True
+            finally:
+                # Release the large DAG dict immediately — do not hold it for the rest of
+                # the loop iteration, as this is the dominant per-molecule memory consumer.
+                del dag_d
 
-    if args.use_lmdb:
-        if txn is None or env is None:
-            raise RuntimeError("LMDB environment was not initialized")
-        txn.commit()
-        env.sync()
-        env.close()
-    elif args.use_hdf5:
+        if not args.skip_stats:
+            frag_results.append(stats_row)
+
+        progress.update(is_error=had_error)
+
+        # Periodic checkpoint so we know how far we got if the process is OOM-killed.
+        if (i + 1) % 500 == 0:
+            with open(meta_info_checkpoint_fp, "w") as _f:
+                json.dump(meta_info, _f)
+            if h5_file is not None:
+                h5_file.flush()
+
+    progress.finish()
+
+    if args.use_hdf5:
         if h5_file is None:
             raise RuntimeError("HDF5 file was not initialized")
         h5_file.close()
     with open(meta_info_fp, "w") as f:
         f.write(json.dumps(meta_info))
+
+    log_frag_output_summary(args, h5_fp, dag_dp)
+
+    if oom_mol_ids:
+        logging.warning(f"OOM occurred for {len(oom_mol_ids)} molecules: {oom_mol_ids}")
+        oom_fp = os.path.join(args.frag_dp, "oom_mol_ids.json")
+        with open(oom_fp, "w") as f:
+            json.dump(oom_mol_ids, f)
+        logging.warning(f"OOM mol_ids saved to {oom_fp}")
+
     if args.skip_stats:
         return
 
-    print("> Fragments Computed")
+    logging.info("Fragments Computed")
+    m_spec_df = merge_spec_df(spec_df)
     # all the following code are not debuged
     frag_stats_df = pd.DataFrame({"mol_id": mol_df["mol_id"]})
 
@@ -448,9 +543,9 @@ def main(args):
             mol_stats_fp = os.path.join(args.frag_dp, "m_mol_stats_df.pkl")
 
         # compute spectra stats
-        peak_spec_df = _spec_df[[spec_key, "mol_id", "peaks", "prec_mz", "prec_type"]].merge(
-            frag_stats_df[id_cols + data_cols], on="mol_id", how="inner"
-        )
+        peak_spec_df = _spec_df[
+            [spec_key, "mol_id", "peaks", "prec_mz", "prec_type", "inst_type"]
+        ].merge(frag_stats_df[id_cols + data_cols], on="mol_id", how="inner")
         assert (
             peak_spec_df.shape[0]
             == peak_spec_df.drop_duplicates(subset=[spec_key, "mol_id"]).shape[0]
@@ -472,24 +567,17 @@ def main(args):
                     row["idx_by_h_delta"],
                     row["prec_mz"],
                     row["prec_type"],
+                    row["inst_type"],
                     tolerances,
                     args.max_h_transfer,
                 ]
             )
 
-        if args.disable_tqdm:
-            stats_iter = spectra_input_rows
-            logging.info(f"Computing spectra stats for {len(spectra_input_rows)} inputs")
-        else:
-            stats_iter = tqdm(
-                spectra_input_rows,
-                desc="Computing spectra stats",
-                total=len(spectra_input_rows),
-            )
-        # run stats
-        stats_results = data_utils.par_apply(stats_iter, compute_spectra_stats, True)
-        # Loky and joblib should keep ordering
+        logging.info(f"Computing spectra stats for {len(spectra_input_rows)} inputs")
+        stats_results = data_utils.par_apply(spectra_input_rows, compute_spectra_stats, True)
+        del spectra_input_rows
         stats_results_df = pd.concat(stats_results, axis=0, ignore_index=True)
+        del stats_results
         metric_keys = list(stats_results_df.columns)
 
         # add peak stats
@@ -586,10 +674,29 @@ if __name__ == "__main__":
         help="Mass tolerance values for peak matching statistics",
     )
     parser.add_argument(
+        "--inst_type_loss_tol",
+        type=json.loads,
+        default=DEFAULT_INST_TYPE_LOSS_TOL,
+        help=(
+            "JSON mapping of instrument type to per-instrument m/z tolerance for the "
+            'inst_tol stats variant, e.g. \'{"FT": {"rel": 1e-5, "min_mz": 200.0}}\'. '
+            "Instrument types absent from the mapping fall back to a 10 ppm relative "
+            "tolerance. Default matches the training configs (FT 10 ppm/200 Da, "
+            "QTOF 20 ppm/750 Da)."
+        ),
+    )
+    parser.add_argument(
         "--isotopes",
         type=booltype,
-        default=True,
-        help="Whether to compute isotopic peak distributions",
+        default=False,
+        help=(
+            "Whether to compute isotopic peak distributions. Keep this False unless a "
+            "config sets frag_params.num_isotopes > 1: formula_peak_mzs is sorted by "
+            "abundance before it is truncated to num_isotopes, so with the default "
+            "num_isotopes=1 an isotope-expanded table hands the model the MOST ABUNDANT "
+            "isotopologue instead of the monoisotopic mass (M+2 for >=3 Cl / >=2 Br). "
+            "Training DAGs are built with ISO_FLAG=False, so True here is a train/serve skew."
+        ),
     )
     parser.add_argument(
         "--wandb_mode",
@@ -605,17 +712,14 @@ if __name__ == "__main__":
         "--compress_dags",
         type=booltype,
         default=True,
-        help=(
-            "Whether to compress per-molecule DAG files when --use_lmdb=False. "
-            "Ignored when --use_lmdb=True."
-        ),
+        help="Whether to compress per-molecule DAG files when --use_hdf5=False.",
     )
     parser.add_argument(
         "--compress_format",
         type=str,
         default="bz2",
         choices=["gz", "bz2"],
-        help="Compression format for DAG files when --compress_dags=True and --use_lmdb=False.",
+        help="Compression format for DAG files when --compress_dags=True and --use_hdf5=False.",
     )
     parser.add_argument(
         "--wandb_run_name", type=str, help="Custom W&B run name (required when wandb_mode enabled)"
@@ -655,7 +759,7 @@ if __name__ == "__main__":
         "--use_hdf5",
         type=booltype,
         default=False,
-        help="Save DAGs to <frag_dp>/dags.h5 (HDF5). Mutually exclusive with --use_lmdb.",
+        help="Save DAGs to <frag_dp>/dags.h5 (HDF5) instead of one pickle per molecule.",
     )
     parser.add_argument(
         "--disable_tqdm",
@@ -668,21 +772,6 @@ if __name__ == "__main__":
         type=booltype,
         default=False,
         help="whether skip stats compute and only compute and save the DAGs ",
-    )
-    parser.add_argument(
-        "--map_size",
-        type=int,
-        default=10 * 1024**3,
-        help="map size for LMDB (bytes). Default 10*1024**3 = 10 GiB",
-    )
-    parser.add_argument(
-        "--use_lmdb",
-        type=booltype,
-        default=False,
-        help=(
-            "Whether to use LMDB to store DAGs. If False, each DAG will be saved as an "
-            "individual pickle file under <frag_dp>/dags/. Default True."
-        ),
     )
     parser.add_argument(
         "--multi_cut_bfs",
@@ -699,13 +788,12 @@ if __name__ == "__main__":
         "--max_cut_size",
         type=int,
         default=2,
-        choices=[1, 2, 3],
+        choices=[1, 2],
         help=(
             "Maximum number of bonds cut simultaneously per BFS step "
             "(only used when --multi_cut_bfs True). "
             "1 = single-bond only (same as standard BFS on rings), "
-            "2 = up to 2 ring bonds (recommended), "
-            "3 = up to 3 ring bonds (depth-0 only, high cost)."
+            "2 = up to 2 ring bonds (recommended)."
         ),
     )
     parser.add_argument(
@@ -736,8 +824,5 @@ if __name__ == "__main__":
     # Check if wandb_mode is enabled but run_name is missing
     if args.wandb_mode != "disabled" and not args.wandb_run_name:
         parser.error("--wandb_run_name is required when --wandb_mode is not 'disabled'")
-
-    if not args.disable_tqdm:
-        tqdm.pandas()
 
     main(args)

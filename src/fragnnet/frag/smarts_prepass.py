@@ -1,8 +1,10 @@
 """SMARTS-based rearrangement prepass for multi-bond BFS fragmentation.
 
-Contains :class:`SmartsFragRule`, :data:`FRAG_RULES`, and
-:func:`_apply_smarts_prepass` — the pure-Python prepass for reactions that
-require new bond formation (1,3-elimination, acyclic ester CO₂ loss).
+Contains :class:`SmartsFragRule`, :data:`FRAG_RULES`, :func:`_apply_smarts_prepass`,
+:class:`NeutralLossRule`, :data:`NL_RULES`, and :func:`_apply_nl_prepass` — the
+pure-Python prepass for reactions that require new bond formation (1,3-elimination,
+acyclic ester CO₂ loss) and neutral-loss rearrangements (SO₂ extrusion, SO₃ loss,
+N₂O extrusion).
 
 Kept in a separate module so the Cython ``.so`` can shadow ``multi_cut_bfs``
 for the BFS entry-point while this prepass remains importable without any
@@ -311,4 +313,217 @@ def _apply_smarts_prepass(
                     inner_mask = cc_masks[next(iter(inner_cc_set))]
                     results.append((outer_mask, inner_mask, rule_idx))
 
+    return results
+
+
+@dataclass
+class NeutralLossRule:
+    """Rule for rearrangements that expel a neutral fragment and form a new bond.
+
+    Unlike :class:`SmartsFragRule`, these reactions cannot be represented as
+    simple bond cuts because the product requires bond formation (e.g. SO₂
+    extrusion creates a new Ar–N bond).  The product is represented as an atom
+    mask covering all precursor atoms *except* the neutral-loss atoms.  Because
+    the new bond is not in the original graph, the product atoms may be
+    disconnected in the original connectivity — H-count estimation will add
+    excess H's at the free valences; the correct formula lands at a negative
+    H-shift in the formula graph (covered by max_h_transfer).
+
+    Attributes:
+        name: Rule identifier for logging.
+        reactant_smarts: SMARTS pattern.  All mapped atoms use 1-based map numbers.
+        nl_map_nums: Map numbers of the atoms that leave as the neutral loss.
+            The product mask = all atoms minus these.
+        nl_mass: Exact monoisotopic neutral-loss mass (Da), for documentation.
+        min_num_atoms: Minimum molecule heavy-atom count for early exit.
+    """
+
+    name: str
+    reactant_smarts: str
+    nl_map_nums: list[int]
+    nl_mass: float
+    min_num_atoms: int = 0
+
+
+NL_RULES: list[NeutralLossRule] = [
+    # Aromatic sulfonamide SO₂ extrusion (HIGHEST PRIORITY).
+    # Ar–SO₂–NH–Het → [Ar–NH–Het]⁻ + SO₂  (NL = 63.962 Da).
+    # A new Ar–N bond forms, so the product atoms are disconnected in the original
+    # graph.  H-cap adds +2H (one at Ar–C, one at N); correct formula at H_delta=-2.
+    # Confirmed in spec_id=610784 and 856552; affects thousands of NIST23 spectra.
+    NeutralLossRule(
+        name="aryl_sulfonamide_so2",
+        reactant_smarts="[c:1]-[SX4:2](=[O:3])(=[O:4])-[NH:5]",
+        nl_map_nums=[2, 3, 4],
+        nl_mass=63.9619,
+        min_num_atoms=8,
+    ),
+    # Aromatic sulfonate SO₂ loss.
+    # Ar–SO₃⁻ → [Ar–O]⁻ + SO₂  (NL = 63.962 Da).
+    # A new Ar–O bond forms; +2H excess at Ar–C and O-; correct formula at H_delta=-2.
+    # Root cause of miss in pyrenes (82.8%) and phenanthrenes (50.9%) in [M-H]-.
+    NeutralLossRule(
+        name="aryl_sulfonate_so2",
+        reactant_smarts="[c:1]-[SX4:2](=[O:3])(=[O:4])[O-,OH:5]",
+        nl_map_nums=[2, 3, 4],
+        nl_mass=63.9619,
+        min_num_atoms=7,
+    ),
+    # Aromatic sulfonate SO₃ loss.
+    # Ar–SO₃⁻ → [Ar]⁻ + SO₃  (NL = 79.957 Da).
+    # Direct S–C bond cleavage; product is a connected Ar anion.
+    # +1H excess at Ar–C; correct formula at H_delta=-1.
+    NeutralLossRule(
+        name="aryl_sulfonate_so3",
+        reactant_smarts="[c:1]-[SX4:2](=[O:3])(=[O:4])[O-,OH:5]",
+        nl_map_nums=[2, 3, 4, 5],
+        nl_mass=79.9568,
+        min_num_atoms=7,
+    ),
+    # N-nitramine N₂O extrusion.
+    # R–N(NO₂)–NH–R' → [R–N=R'] + N₂O  (NL = 44.001 Da).
+    # Confirmed in spec_id=550113 (0.1 mDa).  The O⁻ from NO₂ (:3) stays in the
+    # product; +2H excess at O⁻ and at R' atom; correct formula at H_delta=-2.
+    NeutralLossRule(
+        name="n_nitramine_n2o",
+        reactant_smarts="[N+:1](=[O:2])([O-:3])-[NH:4]-[#6,#7]",
+        nl_map_nums=[1, 2, 4],
+        nl_mass=44.0010,
+        min_num_atoms=5,
+    ),
+    # Sulfoxide SO loss.
+    # R–S(=O)–R' → [R–R'] + SO  (NL = 47.967 Da).
+    # The C–S bonds break and a new C–C bond forms in the product; retained atoms
+    # may be disconnected in the original graph (+2H excess; correct formula at H_delta=-2).
+    # SX3 matches only sulfoxides (3-connected S), excluding sulfones (SX4) and thioethers.
+    NeutralLossRule(
+        name="sulfoxide_so_loss",
+        reactant_smarts="[#6:1]-[SX3:2](=[O:3])-[#6:4]",
+        nl_map_nums=[2, 3],
+        nl_mass=47.9669,
+        min_num_atoms=3,
+    ),
+    # Diarylethylene (stilbene-type) C₂H₂ extrusion.
+    # Ar–CH=CH–Ar' → [Ar–Ar'] + HC≡CH  (NL = 26.016 Da).
+    # The two vinyl CH atoms (:2, :3), each bearing one H, leave as acetylene (C₂H₂).
+    # A new Ar–Ar' bond forms in the product (not present in the precursor), making
+    # this a rearrangement outside BFS DAG coverage. Product atoms are disconnected
+    # in the original graph; H-cap adds +1H at each free Ar valence, so the correct
+    # biaryl formula lands at H_delta=-2 (two excess H from the two cut free valences).
+    # `!R` on :2/:3 excludes bridged vinyl units in fused rings (indene, acenaphthylene)
+    # where the vinyl CH=CH is part of a ring and BFS already covers the 2-bond cut.
+    # min_num_atoms=8: minimum diarylethylene is two 5-membered aromatics + 2 vinyl C.
+    NeutralLossRule(
+        name="diarylvinyl_c2h2_loss",
+        reactant_smarts="[c:1]-[CH;!R:2]=[CH;!R:3]-[c:4]",
+        nl_map_nums=[2, 3],
+        nl_mass=26.0157,
+        min_num_atoms=8,
+    ),
+    # Diaryl ketone CO extrusion (negative mode).
+    # Ar–C(=O)–Ar' → [Ar–Ar']⁻ + CO  (NL = 27.995 Da).
+    # The keto carbon (:2) and its oxygen (:3) leave as CO; a new Ar–Ar' bond forms
+    # in the product.  Cutting both Ar–CO bonds would give 3 CCs (BFS-invalid), so the
+    # merged {Ar+Ar'} atom mask is outside BFS coverage.  H-cap adds +1H at each free
+    # Ar valence; correct biaryl formula at H_delta=-2.
+    # `!R` on :2 excludes ring ketones (chromone, fluorenone) where a 2-CC BFS cut
+    # already covers the product; `[c:1]` and `[c:4]` restrict to diaryl ketones
+    # (excludes acetophenone, chalcone, aldehyde, carboxylic acid).
+    # min_num_atoms=12: minimum is two 5-membered aromatic rings + keto CO (5+5+2).
+    NeutralLossRule(
+        name="diaryl_ketone_co_loss",
+        reactant_smarts="[c:1]-[CX3;!R:2](=[O:3])-[c:4]",
+        nl_map_nums=[2, 3],
+        nl_mass=27.9949,
+        min_num_atoms=12,
+    ),
+    # 2-Aminobenzothiazole HCN extrusion (direct-cation ring fragmentation).
+    # The thiazole ring's C2=N3 unit expels HCN (using one H from the exocyclic
+    # amine), and the remaining fragment retains ring S1 and the exocyclic amine
+    # attached to the benzo ring (aminothiophenol-type cation).  A new Ar–NH2 bond
+    # forms, so the product atoms are disconnected in the original graph; H-cap
+    # adds excess H at C3a (broken N3 bond), S1 (thiol H), and the amine (lost its
+    # only bond) — correct formula lands at a negative H-shift (max_h_transfer).
+    # NL confirmed empirically: mol_id 27770 (spec) shows NL=27.0113 Da at
+    # intensity 217/999 (2nd-most-intense peak); consistent NL≈27.011 across
+    # 13/14 halogenated NIST20 2-aminobenzothiazoles checked.
+    # min_num_atoms=10: bare 2-aminobenzothiazole (C7H6N2S) has 10 heavy atoms.
+    NeutralLossRule(
+        name="aminobenzothiazole_hcn_loss",
+        reactant_smarts="[NX3H2]-[c:1]1[n:2]c2ccccc2s1",
+        nl_map_nums=[1, 2],
+        nl_mass=27.0109,
+        min_num_atoms=10,
+    ),
+]
+
+# Pre-compiled SMARTS patterns (keyed by rule name) — avoid recompiling per molecule.
+_COMPILED_NL_PATTERNS: dict[str, Chem.Mol] = {}
+
+
+def _get_compiled_nl_pattern(rule: NeutralLossRule) -> Chem.Mol | None:
+    """Return a cached compiled SMARTS pattern for *rule*, compiling on first call."""
+    if rule.name not in _COMPILED_NL_PATTERNS:
+        _COMPILED_NL_PATTERNS[rule.name] = Chem.MolFromSmarts(rule.reactant_smarts)
+    return _COMPILED_NL_PATTERNS[rule.name]
+
+
+def _apply_nl_prepass(
+    rules: list[NeutralLossRule],
+    mol: Chem.Mol,
+    num_nodes: int,
+) -> list[tuple[np.ndarray, int]]:
+    """Apply neutral-loss rules to the root molecule.
+
+    For each rule, matches the reactant SMARTS against *mol* and returns a
+    product atom mask that excludes the neutral-loss atoms.  Because the
+    product requires new bond formation, the retained atoms may be disconnected
+    in the original graph; H-count estimation adds excess H's at the free
+    valences.  The correct formula therefore lands at a negative H-shift
+    (see :class:`NeutralLossRule` docstring).
+
+    Args:
+        rules: List of :class:`NeutralLossRule` to apply.
+        mol: RDKit molecule.
+        num_nodes: Number of heavy atoms.
+
+    Returns:
+        List of ``(product_mask, rule_idx)`` tuples.  *product_mask* is a
+        ``(num_nodes,)`` uint8 array with 1 for retained atoms and 0 for
+        neutral-loss atoms.  Duplicate NL atom sets (same atoms lost via
+        different SMARTS embeddings) are deduplicated.
+    """
+    results: list[tuple[np.ndarray, int]] = []
+    for rule_idx, rule in enumerate(rules):
+        if rule.min_num_atoms > 0 and num_nodes < rule.min_num_atoms:
+            continue
+        patt = _get_compiled_nl_pattern(rule)
+        if patt is None:
+            continue
+        q_idx_to_map: dict[int, int] = {}
+        for q_idx in range(patt.GetNumAtoms()):
+            map_num = patt.GetAtomWithIdx(q_idx).GetAtomMapNum()
+            if map_num != 0:
+                q_idx_to_map[q_idx] = map_num
+        seen_nl_sets: set[frozenset] = set()
+        for match in mol.GetSubstructMatches(patt):
+            map_to_mol: dict[int, int] = {m: match[q] for q, m in q_idx_to_map.items()}
+            nl_atoms: set[int] = set()
+            valid = True
+            for nl_map in rule.nl_map_nums:
+                mol_idx = map_to_mol.get(nl_map)
+                if mol_idx is None:
+                    valid = False
+                    break
+                nl_atoms.add(mol_idx)
+            if not valid:
+                continue
+            nl_key = frozenset(nl_atoms)
+            if nl_key in seen_nl_sets:
+                continue
+            seen_nl_sets.add(nl_key)
+            product_mask = np.ones(num_nodes, dtype=MASK_DTYPE)
+            for idx in nl_atoms:
+                product_mask[idx] = 0
+            results.append((product_mask, rule_idx))
     return results
